@@ -1,7 +1,7 @@
 # src\mcgrp_app\gui\worker.py
 
 import traceback
-import geopandas as gpd
+import pandas as pd
 from pathlib import Path
 from shapely.geometry import box, Point
 
@@ -9,7 +9,7 @@ from PySide6.QtCore import QObject, Signal, Slot
 
 from ..core.graph import GraphEditor, ShortestPathAnalyzer
 from ..core.pipeline import GeoPipeline
-from ..core.utils import FieldConfigType, FieldsManager, GraphState, GeoCalculator
+from ..core.utils import FieldConfigType, FieldsManager, GraphState, GeoCalculator, GeoFactory
 from ..core.instance import MCGRPInstanceGenerator, MCGRPTPInstanceGenerator
 
 class PipelineWorker(QObject):
@@ -20,7 +20,7 @@ class PipelineWorker(QObject):
     
     # --- Sinais de feedback para a MainWindow ---
     progress_update = Signal(int, int, str)
-    processing_complete = Signal(gpd.GeoDataFrame, gpd.GeoDataFrame, str, dict)
+    processing_complete = Signal(pd.DataFrame, pd.DataFrame, str, dict)
     processing_error = Signal(str)
 
     # --- SINAIS (Worker -> GUI) ---
@@ -35,7 +35,7 @@ class PipelineWorker(QObject):
 
     # Sinal para atualização completa
     # Usado para Adição de Nó ou Carregamento do DB
-    node_added_and_state_updated = Signal(gpd.GeoDataFrame, gpd.GeoDataFrame)
+    node_added_and_state_updated = Signal(pd.DataFrame, pd.DataFrame)
 
     # Sinal de sucesso da finalização
     finalization_complete = Signal(int)
@@ -55,8 +55,8 @@ class PipelineWorker(QObject):
         self.pipeline.processing_complete.connect(self.processing_complete)
         self.pipeline.processing_error.connect(self.processing_error)
 
-    def _get_pipeline_state_gdfs(self):
-        """Helper para verificar e retornar GDFs de dados."""
+    def _get_pipeline_state_dfs(self):
+        """Helper para verificar e retornar DataFrames de dados."""
         if not self.pipeline.state or self.pipeline.state.data_streets is None:
             self.processing_error.emit("Estado do pipeline não está pronto.")
             return None, None, None, None
@@ -72,8 +72,8 @@ class PipelineWorker(QObject):
             self.pipeline.state.map_points
         )
 
-    @Slot(gpd.GeoDataFrame, gpd.GeoDataFrame, str)
-    def run_pipeline_processing(self, streets_gdf, neighborhoods_gdf, run_name: str):
+    @Slot(pd.DataFrame, pd.DataFrame, str)
+    def run_pipeline_processing(self, streets_df, neighborhoods_df, run_name: str):
         """
         Este é o Slot que a MainWindow (thread principal) irá chamar.
         Ele executa o trabalho pesado de forma síncrona.
@@ -82,7 +82,7 @@ class PipelineWorker(QObject):
             print("Worker Thread: Recebeu sinal. Iniciando pipeline...")
             
             # Chama o método que faz todo o trabalho pesado
-            self.pipeline.start_processing(streets_gdf, neighborhoods_gdf, run_name)
+            self.pipeline.start_processing(streets_df, neighborhoods_df, run_name)
             
             print("Worker Thread: Pipeline concluído.")
             
@@ -126,42 +126,43 @@ class PipelineWorker(QObject):
 
     @Slot(int)
     def on_toggle_street(self, street_id: int):
-        gdfs = self._get_pipeline_state_gdfs()
-        if gdfs[0] is None: return
-        data_streets_gdf, _, map_streets_gdf, _ = gdfs
+        dfs = self._get_pipeline_state_dfs()
+        if dfs[0] is None: return
+        data_streets_df, _, map_streets_df, _ = dfs
 
         try:
-            street_row_series = data_streets_gdf.loc[data_streets_gdf['id'] == street_id]
+            street_row_series = data_streets_df.loc[data_streets_df['id'] == street_id]
             if street_row_series.empty: return
             
             idx = street_row_series.iloc[0].name
-            is_req = data_streets_gdf.loc[idx].get('eh_requerido', 'no') == 'yes'
+            is_req = data_streets_df.at[idx, 'eh_requerido'] == 'yes'
             new_status = 'no' if is_req else 'yes'
             
-            data_streets_gdf.loc[idx, 'eh_requerido'] = new_status
-            data_streets_gdf.loc[idx, 'demanda'] = 1 if new_status == 'yes' else 0
+            data_streets_df.at[idx, 'eh_requerido'] = new_status
+            data_streets_df.at[idx, 'demanda'] = 1 if new_status == 'yes' else 0
             
-            map_idx = map_streets_gdf.loc[map_streets_gdf['id'] == street_id].index
-            if not map_idx.empty:
-                map_streets_gdf.loc[map_idx, 'eh_requerido'] = new_status
-                map_streets_gdf.loc[map_idx, 'demanda'] = 1 if new_status == 'yes' else 0
+            map_mask = map_streets_df['id'] == street_id
+            if map_mask.any():
+                map_streets_df.loc[map_mask, 'eh_requerido'] = new_status
+                map_streets_df.loc[map_mask, 'demanda'] = 1 if new_status == 'yes' else 0
             
-            self.street_toggled.emit(street_id, new_status, data_streets_gdf.loc[idx].to_dict())
+            self.street_toggled.emit(street_id, new_status, data_streets_df.loc[idx].to_dict())
         except Exception as e:
             self.processing_error.emit(f"Erro ao alternar rua {street_id}: {e}")
+            traceback.print_exc()
 
     @Slot(int, int)
     def on_toggle_node(self, node_id: int, service_cost: int):
-        gdfs = self._get_pipeline_state_gdfs()
-        if gdfs[1] is None: return
-        _, data_points_gdf, _, map_points_gdf = gdfs
+        dfs = self._get_pipeline_state_dfs()
+        if dfs[1] is None: return
+        _, data_points_df, _, map_points_df = dfs
 
         try:
             # Encontra o nó
-            node_mask = data_points_gdf['node_index'] == node_id
+            node_mask = data_points_df['node_index'] == node_id
             if not node_mask.any(): return
             
-            node_row = data_points_gdf[node_mask].iloc[0]
+            node_row = data_points_df[node_mask].iloc[0]
             is_req = node_row.get('eh_requerido', 'no') == 'yes'
             
             # Verifica se é temporário (vertex_index == -1)
@@ -185,26 +186,26 @@ class PipelineWorker(QObject):
             else:
                 # --- TOGGLE NORMAL ---
                 new_status = 'no' if is_req else 'yes'
-                data_points_gdf.loc[node_mask, 'eh_requerido'] = new_status
+                data_points_df.loc[node_mask, 'eh_requerido'] = new_status
 
                 if new_status == 'yes':
-                    data_points_gdf.loc[node_mask, 'custo_servico'] = service_cost
-                    data_points_gdf.loc[node_mask, 'demanda'] = 1
+                    data_points_df.loc[node_mask, 'custo_servico'] = service_cost
+                    data_points_df.loc[node_mask, 'demanda'] = 1
                 else:
-                    data_points_gdf.loc[node_mask, 'custo_servico'] = 0     # Reseta se desmarcar
-                    data_points_gdf.loc[node_mask, 'demanda'] = 0
+                    data_points_df.loc[node_mask, 'custo_servico'] = 0     # Reseta se desmarcar
+                    data_points_df.loc[node_mask, 'demanda'] = 0
                 
-                map_mask = map_points_gdf['node_index'] == node_id
+                map_mask = map_points_df['node_index'] == node_id
                 if map_mask.any():
-                    map_points_gdf.loc[map_mask, 'eh_requerido'] = new_status
+                    map_points_df.loc[map_mask, 'eh_requerido'] = new_status
                     if new_status == 'yes':
-                        map_points_gdf.loc[map_mask, 'custo_servico'] = service_cost
-                        map_points_gdf.loc[map_mask, 'demanda'] = 1
+                        map_points_df.loc[map_mask, 'custo_servico'] = service_cost
+                        map_points_df.loc[map_mask, 'demanda'] = 1
                     else:
-                        map_points_gdf.loc[map_mask, 'custo_servico'] = 0
-                        map_points_gdf.loc[map_mask, 'demanda'] = 0
+                        map_points_df.loc[map_mask, 'custo_servico'] = 0
+                        map_points_df.loc[map_mask, 'demanda'] = 0
                 
-                self.node_toggled.emit(node_id, new_status, data_points_gdf[node_mask].iloc[0].to_dict())
+                self.node_toggled.emit(node_id, new_status, data_points_df[node_mask].iloc[0].to_dict())
 
         except Exception as e:
             self.processing_error.emit(f"Erro ao alternar nó {node_id}: {e}")
@@ -212,9 +213,9 @@ class PipelineWorker(QObject):
 
     @Slot(int)
     def on_set_depot(self, new_id: int):
-        gdfs = self._get_pipeline_state_gdfs()
-        if gdfs[1] is None: return
-        _, data_pts, _, map_pts = gdfs
+        dfs = self._get_pipeline_state_dfs()
+        if dfs[1] is None: return
+        _, data_pts, _, map_pts = dfs
 
         try:
             new_mask = data_pts['node_index'] == new_id
@@ -254,9 +255,9 @@ class PipelineWorker(QObject):
                     self.pipeline.state = self.graph_editor.remove_node_and_merge_streets(self.pipeline.state, curr_id)
                     
                     # Atualizando GDFs
-                    gdfs = self._get_pipeline_state_gdfs()
-                    data_pts = gdfs[1]
-                    map_pts = gdfs[3]
+                    dfs = self._get_pipeline_state_dfs()
+                    data_pts = dfs[1]
+                    map_pts = dfs[3]
                     
                     # Recalcula máscara do novo nó
                     new_mask = data_pts['node_index'] == new_id
@@ -293,42 +294,48 @@ class PipelineWorker(QObject):
     @Slot(object)
     def on_box_select_streets(self, selection_box: box):
         """Define 'eh_requerido' para ruas dentro da caixa."""
-        gdfs = self._get_pipeline_state_gdfs()
-        if gdfs[0] is None: return
-        data_streets_gdf, map_streets_gdf = gdfs[0], gdfs[2]
+        dfs = self._get_pipeline_state_dfs()
+        if dfs[0] is None: return
+        data_streets_df, map_streets_df = dfs[0], dfs[2]
         
         try:
-            selected_mask = map_streets_gdf.intersects(selection_box)
-            selected_ids = set(map_streets_gdf[selected_mask]['id'])
-            if not selected_ids: return
+            temp_gdf = GeoFactory.to_gdf(map_streets_df, self.pipeline.state.crs)
+
+            selected_mask = temp_gdf.intersects(selection_box)
+            selected_ids = set(temp_gdf[selected_mask]['id'])
+            if not selected_ids:
+                return
             
             # Encontra as linhas no GDF de DADOS
-            rows_to_update_mask_data = data_streets_gdf['id'].isin(selected_ids)
-            rows_to_update_mask_data = rows_to_update_mask_data & (data_streets_gdf['eh_requerido'] != 'yes')
-            if not rows_to_update_mask_data.any(): return
-            data_streets_gdf.loc[rows_to_update_mask_data, 'eh_requerido'] = 'yes'
-            data_streets_gdf.loc[rows_to_update_mask_data, 'demanda'] = 1
+            rows_to_update_mask_data = data_streets_df['id'].isin(selected_ids)
+            rows_to_update_mask_data = rows_to_update_mask_data & (data_streets_df['eh_requerido'] != 'yes')
+
+            if rows_to_update_mask_data.any():
+                data_streets_df.loc[rows_to_update_mask_data, 'eh_requerido'] = 'yes'
+                data_streets_df.loc[rows_to_update_mask_data, 'demanda'] = 1
+
+                # Emite sinal para CADA rua alterada
+                for index, street_row in data_streets_df[rows_to_update_mask_data].iterrows():
+                    self.street_toggled.emit(street_row['id'], 'yes', street_row.to_dict())
 
             # Encontra as linhas no GDF de MAPA
-            rows_to_update_mask_map = map_streets_gdf['id'].isin(selected_ids)
-            map_streets_gdf.loc[rows_to_update_mask_map, 'eh_requerido'] = 'yes'
-            map_streets_gdf.loc[rows_to_update_mask_map, 'demanda'] = 1
-
-            # Emite sinal para CADA rua alterada
-            for index, street_row in data_streets_gdf[rows_to_update_mask_data].iterrows():
-                self.street_toggled.emit(street_row['id'], 'yes', street_row.to_dict())
+            rows_to_update_mask_map = map_streets_df['id'].isin(selected_ids)
+            if rows_to_update_mask_map.any():
+                map_streets_df.loc[rows_to_update_mask_map, 'eh_requerido'] = 'yes'
+                map_streets_df.loc[rows_to_update_mask_map, 'demanda'] = 1
                 
         except Exception as e:
             self.processing_error.emit(f"Worker: Erro na seleção em caixa (ruas): {e}")
+            traceback.print_exc()
 
     @Slot(int, dict, bool, int)
     def on_add_node_at_street(self, street_id: int, click_coords: dict, is_depot: bool, service_cost: int):
         """
         Adiciona um nó e divide a rua associada em duas.
         """
-        gdfs = self._get_pipeline_state_gdfs()
-        if gdfs[0] is None: return
-        data_streets, data_pts, _, map_pts = gdfs
+        dfs = self._get_pipeline_state_dfs()
+        if dfs[0] is None: return
+        data_streets, data_pts, _, map_pts = dfs
         
         try:
             print(f"Worker: Recebida requisição para dividir a rua {street_id} em {click_coords}")
@@ -353,20 +360,23 @@ class PipelineWorker(QObject):
                             self.pipeline.state, old_depot_id
                         )
                         
-                        # Atualiza referências locais pois o estado mudou (GDFs recriados)
-                        gdfs = self._get_pipeline_state_gdfs()
-                        data_streets = gdfs[0]
-                        data_pts = gdfs[1]
-                        map_streets_ref = gdfs[2]
-                        map_pts = gdfs[3]
+                        # Atualiza referências locais
+                        dfs = self._get_pipeline_state_dfs()
+                        data_streets = dfs[0]
+                        data_pts = dfs[1]
+                        map_streets_ref = dfs[2]
+                        map_pts = dfs[3]
                         
                         # Verifica se a rua clicada ainda existe após a fusão
                         if street_id not in data_streets['id'].values:
                             print(f"Worker: Rua {street_id} foi mesclada. Redescobrindo...")
+
+                            temp_gdf = GeoFactory.to_gdf(map_streets_ref, self.pipeline.state.crs)
+
                             click_point = Point(click_coords['lon'], click_coords['lat'])
-                            closest_idx = map_streets_ref.distance(click_point).idxmin()
-                            street_id = int(map_streets_ref.loc[closest_idx, 'id'])
-                            print(f"Worker: Nova rua alvo: {street_id}")
+                            closest_idx = temp_gdf.distance(click_point).idxmin()
+                            street_id = int(temp_gdf.loc[closest_idx, 'id'])
+                            print(f"Worker: Nova rua alvo encontrada: {street_id}")
 
                     else:
                         # CASO 2: Depósito antigo é VERDADEIRO -> APENAS DESMARCAR
@@ -378,8 +388,7 @@ class PipelineWorker(QObject):
                         # Desmarca no GDF de MAPA (para consistência visual imediata)
                         map_pts.loc[map_pts['node_index'] == old_depot_id, 'depot'] = 'no'
             
-            # Pega o CRS
-            map_crs = map_pts.crs or GeoCalculator.BASE_CRS
+            # Preparação do novo nó
             new_geom = Point(click_coords['lon'], click_coords['lat'])
             
             new_id = int(data_pts['node_index'].max()) + 1
@@ -398,9 +407,9 @@ class PipelineWorker(QObject):
                 'demanda': 0 if is_depot else 1
             }
             
-            temp_gdf = gpd.GeoDataFrame([new_node_data], crs=map_crs)
-            temp_gdf = FieldsManager.ensure_fields_exist(temp_gdf, FieldConfigType.EXTENDED)
-            new_node_row = temp_gdf.iloc[0]
+            temp_df = pd.DataFrame([new_node_data])
+            temp_df = FieldsManager.ensure_fields_exist(temp_df, FieldConfigType.EXTENDED)
+            new_node_row = temp_df.iloc[0]
 
             new_state = self.graph_editor.split_street(
                 self.pipeline.state, street_id, new_node_row, is_depot
@@ -503,7 +512,7 @@ class PipelineWorker(QObject):
             kept_neighborhood_ids = analyzer.analyze_neighborhoods()
             
             if not kept_neighborhood_ids:
-                print("Aviso: Análise retornou conjunto vazio. Mantendo tudo para evitar limpeza total.")
+                print("Aviso: Análise retornou conjunto vazio. Mantendo tudo.")
                 self.node_added_and_state_updated.emit(
                     self.pipeline.state.map_streets, self.pipeline.state.map_points
                 )
@@ -536,12 +545,12 @@ class PipelineWorker(QObject):
             ].copy().reset_index(drop=True)
 
             # Filtra Bairros
-            if state.neighborhoods is not None:
+            if state.neighborhoods is not None and not state.neighborhoods.empty:
                 state.neighborhoods = state.neighborhoods[
                     state.neighborhoods['id_bairro'].isin(kept_neighborhood_ids)
                 ].copy().reset_index(drop=True)
 
-            # Remove nós folhas não úteis (e suas ruas, caso dê)
+            # Remove nós folhas
             analyzer.prune_dead_ends()
 
             print(f"Worker: Grafo reduzido. Ruas restantes: {len(state.data_streets)}")

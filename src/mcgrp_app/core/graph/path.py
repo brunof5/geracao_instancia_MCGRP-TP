@@ -16,16 +16,17 @@ class ShortestPathAnalyzer:
         
         # Verifica se temos os dados necessários
         if self.state.neighborhoods is None:
-            raise ValueError("GDF de Bairros é necessário para análise de caminhos.")
+            raise ValueError("DataFrame de Bairros é necessário para análise de caminhos.")
         
         self.depot_node = None
+        self.depot_id_bairro = None
         self.graph = defaultdict(list)
         self.neighborhood_connections = {}              # Bairro -> Depósito
         self.neighborhood_connections_return = {}       # Depósito -> Bairro
 
         # Mapa de fronteiras dos bairros
         self.bairros_boundaries = {
-            row["id_bairro"]: row.geometry.boundary
+            row["id_bairro"]: row["geometry"].boundary
             for _, row in self.state.neighborhoods.iterrows()
         }
 
@@ -47,7 +48,8 @@ class ShortestPathAnalyzer:
         kept_neighborhoods = set(required_neighborhoods)
         
         # Adiciona o bairro do depósito (sempre necessário)
-        kept_neighborhoods.add(self.depot_id_bairro)
+        if self.depot_id_bairro is not None:
+            kept_neighborhoods.add(self.depot_id_bairro)
 
         for data in self.neighborhood_connections.values():
             kept_neighborhoods.update(data["neighbors"])
@@ -62,7 +64,8 @@ class ShortestPathAnalyzer:
         # Limpa grafo anterior
         self.graph = defaultdict(list)
         
-        if self.state.data_streets is None: return
+        if self.state.data_streets is None or self.state.data_streets.empty:
+            return
 
         for row in self.state.data_streets.itertuples():
             u = int(getattr(row, 'from_node'))
@@ -81,7 +84,7 @@ class ShortestPathAnalyzer:
     def _find_depot(self) -> None:
         """Localiza o nó e o bairro do depósito."""
         if self.state.data_points is None:
-            raise ValueError("GDF de Pontos vazio.")
+            raise ValueError("DataFrame de Pontos vazio.")
             
         depot_rows = self.state.data_points[self.state.data_points['depot'] == 'yes']
         if depot_rows.empty:

@@ -4,9 +4,10 @@ import pandas as pd
 import geopandas as gpd
 import traceback
 import itertools
+from typing import Tuple
 from shapely.geometry import LineString
 
-from ..utils import FieldsManager, FieldConfigType, GeoCalculator, GraphState
+from ..utils import FieldsManager, FieldConfigType, GeoCalculator, GraphState, GeoFactory
 
 class GeoProcessor:
     """
@@ -17,27 +18,30 @@ class GeoProcessor:
     BOUNDARY_DISTANCE_THRESHOLD_M = 1       # Distância (m) para considerar um ponto "na fronteira"
     PROTECTION_DISTANCE_KM = 0.05           # 50m (distância para proteger segmento)
 
-    def __init__(self, neighborhoods_gdf: gpd.GeoDataFrame):
+    def __init__(self, neighborhoods_df: pd.DataFrame):
         self.BASE_CRS = GeoCalculator.BASE_CRS
         self.PROJECTED_CRS = GeoCalculator.PROJECTED_CRS
-        self.neighborhoods_gdf = neighborhoods_gdf
+        self.neighborhoods_df = neighborhoods_df.copy()
 
-        # Projeta os bairros (cache)
-        self.neighborhoods_gdf_proj = self.neighborhoods_gdf.to_crs(self.PROJECTED_CRS)
-        
-        # Cria um mapa (dicionário) para consulta rápida de nomes de bairros
-        self.bairro_name_map = self.neighborhoods_gdf.set_index('id_bairro')['bairro'].to_dict()
-        
-        # Obtém TODAS as geometrias de fronteira (ainda em 4326)
-        all_boundaries_4326 = self.neighborhoods_gdf.geometry.boundary
-        
-        # Projeta a GeoSeries inteira
+        # Cria GDF temporário
+        neigh_gdf = GeoFactory.to_gdf(self.neighborhoods_df, self.BASE_CRS)
+
+        # Projeta para métrico
+        self.neighborhoods_gdf_proj = neigh_gdf.to_crs(self.PROJECTED_CRS)
+
+        # Cache de nomes
+        self.bairro_name_map = self.neighborhoods_df.set_index('id_bairro')['bairro'].to_dict()
+
+        # Cache de Fronteiras Projetadas
+        all_boundaries_4326 = neigh_gdf.geometry.boundary
+
+        # Projeta boundaries
         all_boundaries_proj = all_boundaries_4326.to_crs(self.PROJECTED_CRS)
 
-        # Cria o dicionário (map) usando 'zip', agora temos a fronteira de cada bairro (cache)
+        # Mapa: id_bairro -> geometria da fronteira (projetada)
         self.bairros_fronteiras_proj = {
             id_bairro: boundary_geom
-            for id_bairro, boundary_geom in zip(self.neighborhoods_gdf['id_bairro'], all_boundaries_proj)
+            for id_bairro, boundary_geom in zip(self.neighborhoods_df['id_bairro'], all_boundaries_proj)
         }
     
     def filter_and_normalize(self, state: GraphState) -> GraphState:
@@ -65,25 +69,25 @@ class GeoProcessor:
 
         return state
 
-    def _filter_columns(self, gdf: gpd.GeoDataFrame, keep_cols: list) -> gpd.GeoDataFrame:
+    def _filter_columns(self, df: pd.DataFrame, keep_cols: list) -> pd.DataFrame:
         """Mantém apenas as colunas da lista 'keep_cols'."""
         # Colunas que existem no GDF e também estão na lista de 'keep_cols'
-        cols_to_keep = [col for col in gdf.columns if col in keep_cols]
+        cols_to_keep = [col for col in df.columns if col in keep_cols]
         
         # Colunas a serem removidas
-        cols_to_drop = [col for col in gdf.columns if col not in cols_to_keep]
+        cols_to_drop = [col for col in df.columns if col not in cols_to_keep]
         
         if cols_to_drop:
-            gdf = gdf.drop(columns=cols_to_drop)
+            df = df.drop(columns=cols_to_drop)
             
-        return gdf
+        return df
     
-    def _normalize_names(self, gdf: gpd.GeoDataFrame):
+    def _normalize_names(self, df: pd.DataFrame):
         """Preenche 'name' com 'alt_name' ou 'desconhecida'."""
-        if 'name' in gdf.columns:
-            if 'alt_name' in gdf.columns:
-                gdf.loc[gdf['name'].isnull(), 'name'] = gdf['alt_name']
-            gdf.loc[gdf['name'].isnull(), 'name'] = "desconhecida"
+        if 'name' in df.columns:
+            if 'alt_name' in df.columns:
+                df.loc[df['name'].isnull(), 'name'] = df['alt_name']
+            df.loc[df['name'].isnull(), 'name'] = "desconhecida"
 
     def process_neighborhood_boundaries(self, state: GraphState) -> GraphState:
         """
@@ -124,15 +128,15 @@ class GeoProcessor:
         return state
 
     def _adjust_boundary_vertices(self, idx1: int, idx2: int, 
-                                  data_gdf: gpd.GeoDataFrame, 
-                                  map_gdf: gpd.GeoDataFrame) -> bool:
+                                  data_df: pd.DataFrame, 
+                                  map_df: pd.DataFrame) -> bool:
         """
         Ajusta vértices de fronteira entre dois segmentos de rua (idx1, idx2).
         Retorna True se uma modificação foi feita, False caso contrário.
         """
         # Pega as linhas de ambos os GDFs
-        row1_data = data_gdf.loc[idx1]
-        row2_data = data_gdf.loc[idx2]
+        row1_data = data_df.loc[idx1]
+        row2_data = data_df.loc[idx2]
         
         # Se forem do mesmo bairro, não faz nada
         if row1_data['id_bairro'] == row2_data['id_bairro']:
@@ -166,42 +170,44 @@ class GeoProcessor:
                 geom1 = LineString(coords1) if len(coords1) >= 2 else LineString()
                 geom2 = LineString(coords2) if len(coords2) >= 2 else LineString()
                 
-                # Atualiza os GDFs
-                data_gdf.loc[idx1, 'geometry'] = geom1
-                data_gdf.loc[idx2, 'geometry'] = geom2
-                map_gdf.loc[idx1, 'geometry'] = geom1
-                map_gdf.loc[idx2, 'geometry'] = geom2
+                # Atualiza DataFrame Data
+                data_df.at[idx1, 'geometry'] = geom1
+                data_df.at[idx2, 'geometry'] = geom2
+                
+                # Atualiza DataFrame Mapa (se índices existirem)
+                if idx1 in map_df.index: map_df.at[idx1, 'geometry'] = geom1
+                if idx2 in map_df.index: map_df.at[idx2, 'geometry'] = geom2
             except Exception as e:
                 print(f"  Aviso: Falha ao recriar geometria para índices {idx1}, {idx2}. {e}")
                 return False
 
         return modified
     
-    def _reassign_neighborhood(self, modified_indices: list, data_gdf: gpd.GeoDataFrame, map_gdf: gpd.GeoDataFrame):
+    def _reassign_neighborhood(self, modified_indices: list, data_df: pd.DataFrame, map_df: pd.DataFrame):
         """
         Reatribui bairros usando a regra da DOMINÂNCIA (>50%).
         """
         try:
             # Filtra apenas ruas válidas
-            modified_streets_gdf = data_gdf.loc[modified_indices]
+            modified_streets_df = data_df.loc[modified_indices].copy()
+
+            # Remove NaNs/None
+            modified_streets_df = modified_streets_df[modified_streets_df['geometry'].notna()]
             
             # Remove geometrias vazias
-            modified_streets_gdf = modified_streets_gdf[~modified_streets_gdf.geometry.is_empty]
-            
-            # Remove NaNs/None
-            modified_streets_gdf = modified_streets_gdf[modified_streets_gdf.geometry.notna()]
+            modified_streets_df = modified_streets_df[~modified_streets_df['geometry'].apply(lambda g: g.is_empty)]
             
             # Valida tipo e integridade
-            mask_valid = (modified_streets_gdf.geometry.type == 'LineString') & \
-                          modified_streets_gdf.geometry.is_valid
+            valid_mask = modified_streets_df['geometry'].apply(lambda g: g.is_valid and g.geom_type == 'LineString')
+            modified_streets_df = modified_streets_df[valid_mask]
             
-            modified_streets_gdf = modified_streets_gdf[mask_valid]
-            
-            if modified_streets_gdf.empty: return
+            if modified_streets_df.empty:
+                return
 
             # Projeta ruas
-            modified_streets_gdf['orig_idx'] = modified_streets_gdf.index
-            streets_proj = modified_streets_gdf.to_crs(self.PROJECTED_CRS)
+            modified_streets_df['orig_idx'] = modified_streets_df.index
+            temp_gdf = GeoFactory.to_gdf(modified_streets_df, self.BASE_CRS)
+            streets_proj = temp_gdf.to_crs(self.PROJECTED_CRS)
             streets_proj['total_len'] = streets_proj.geometry.length
 
             # Overlay
@@ -245,19 +251,19 @@ class GeoProcessor:
                 # Regra de Ouro: > 50%
                 if best_match['coverage_pct'] > 0.50:
                     new_bairro_id = int(best_match['target_id_bairro'])
-                    current_bairro_id = data_gdf.loc[orig_idx, 'id_bairro']
+                    current_bairro_id = data_df.loc[orig_idx, 'id_bairro']
                     
                     if new_bairro_id != current_bairro_id:
                         new_name = self.bairro_name_map.get(new_bairro_id, "DESCONHECIDO")
                         
                         # Atualiza Dados
-                        data_gdf.at[orig_idx, 'id_bairro'] = new_bairro_id
-                        data_gdf.at[orig_idx, 'bairro'] = new_name
+                        data_df.at[orig_idx, 'id_bairro'] = new_bairro_id
+                        data_df.at[orig_idx, 'bairro'] = new_name
                         
                         # Atualiza Mapa
-                        if orig_idx in map_gdf.index:
-                            map_gdf.at[orig_idx, 'id_bairro'] = new_bairro_id
-                            map_gdf.at[orig_idx, 'bairro'] = new_name
+                        if orig_idx in map_df.index:
+                            map_df.at[orig_idx, 'id_bairro'] = new_bairro_id
+                            map_df.at[orig_idx, 'bairro'] = new_name
                         
                         updates_count += 1
 
@@ -268,36 +274,36 @@ class GeoProcessor:
             print(f"  Erro na reatribuição de bairros: {e}")
             traceback.print_exc()
 
-    def _remove_invalid_linestrings(self, data_gdf: gpd.GeoDataFrame, map_gdf: gpd.GeoDataFrame) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
+    def _remove_invalid_linestrings(self, data_df: pd.DataFrame, map_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """Remove linhas que ficaram com menos de 2 pontos."""
         print("  Removendo LineStrings inválidas (menos de 2 pontos).")
         
         # Filtra geometrias válidas
-        is_valid = data_gdf.geometry.apply(
+        is_valid = data_df['geometry'].apply(
             lambda geom: geom is not None and not geom.is_empty and geom.geom_type == 'LineString' and len(geom.coords) >= 2
         )
         
         invalid_count = len(is_valid[~is_valid])
         if invalid_count > 0:
             print(f"  {invalid_count} ruas inválidas removidas.")
-            data_gdf = data_gdf[is_valid].copy()
-            map_gdf = map_gdf[is_valid].copy()
+            data_df = data_df[is_valid].copy()
+            map_df = map_df[is_valid].copy()
 
             print("  Re-indexando o campo 'id' das ruas...")
             
             # Reseta o índice principal do DataFrame (0, 1, 2, ... N-1)
             # 'drop=True' impede que o índice antigo vire uma coluna
-            data_gdf.reset_index(drop=True, inplace=True)
-            map_gdf.reset_index(drop=True, inplace=True)
+            data_df.reset_index(drop=True, inplace=True)
+            map_df.reset_index(drop=True, inplace=True)
 
             # Cria a nova lista de IDs (1, 2, 3, ... N)
-            new_ids = range(1, len(data_gdf) + 1)
+            new_ids = range(1, len(data_df) + 1)
 
             # Sobrescreve a coluna 'id' existente com os novos IDs
-            data_gdf['id'] = new_ids
-            map_gdf['id'] = new_ids
+            data_df['id'] = new_ids
+            map_df['id'] = new_ids
 
-        return data_gdf, map_gdf
+        return data_df, map_df
 
     def remove_invalid_endpoints(self, state: GraphState) -> GraphState:
         """
@@ -316,33 +322,33 @@ class GeoProcessor:
         lines_to_remove_ids = set()
 
         # Itera sobre cada grupo de pontos (de cada rua)
-        for line_id, pontos_gdf in points_by_line_id.items():
-            vertices_count = len(pontos_gdf)
+        for line_id, pontos_df in points_by_line_id.items():
+            vertices_count = len(pontos_df)
             if vertices_count < 2:
                 continue
 
             # Verifica o PONTO INICIAL (vertex_index == 0)
-            start_point = pontos_gdf.iloc[0]
+            start_point = pontos_df.iloc[0]
             if start_point['eh_unido'] == 'no':
-                if self._is_point_removable(start_point, pontos_gdf.iloc[1]['distance']):
+                if self._is_point_removable(start_point, pontos_df.iloc[1]['distance']):
                     if vertices_count == 2:
                         lines_to_remove_ids.add(line_id)
-                        points_to_remove_idx.update(pontos_gdf.index)
+                        points_to_remove_idx.update(pontos_df.index)
                     else:
                         points_to_remove_idx.add(start_point.name)
-                        self._shorten_line_start(line_id, pontos_gdf, state)
+                        self._shorten_line_start(line_id, pontos_df, state)
             
             # Verifica o PONTO FINAL (se a linha ainda for válida)
             if line_id not in lines_to_remove_ids and vertices_count > 0:
-                end_point = pontos_gdf.iloc[-1]
+                end_point = pontos_df.iloc[-1]
                 if end_point['eh_unido'] == 'no':
                     if self._is_point_removable(end_point, end_point['distance']):
                         if vertices_count == 2:
                             lines_to_remove_ids.add(line_id)
-                            points_to_remove_idx.update(pontos_gdf.index)
+                            points_to_remove_idx.update(pontos_df.index)
                         else:
                             points_to_remove_idx.add(end_point.name)
-                            self._shorten_line_end(line_id, pontos_gdf, state)
+                            self._shorten_line_end(line_id, pontos_df, state)
 
         print(f"  {len(points_to_remove_idx)} pontos e {len(lines_to_remove_ids)} linhas marcados para remoção.")
 
@@ -365,14 +371,14 @@ class GeoProcessor:
         if id_bairro not in self.bairros_fronteiras_proj:
             return False        # Bairro sem fronteira (??)
 
-        # Pega a fronteira pré-projetada do cache
+        # Obtém a fronteira pré-projetada do cache
         fronteira_proj = self.bairros_fronteiras_proj[id_bairro]
         
         # Projeta o ponto para metros
-        ponto_gds = gpd.GeoSeries(
+        ponto_gs = gpd.GeoSeries(
             [point_row.geometry], crs=self.BASE_CRS
         )
-        ponto_proj = ponto_gds.to_crs(self.PROJECTED_CRS).iloc[0]
+        ponto_proj = ponto_gs.to_crs(self.PROJECTED_CRS).iloc[0]
 
         # Verifica proximidade com fronteira
         if ponto_proj.distance(fronteira_proj) <= self.BOUNDARY_DISTANCE_THRESHOLD_M:
@@ -384,36 +390,44 @@ class GeoProcessor:
             
         return False                # Não está perto da fronteira
     
-    def _shorten_line_start(self, line_id: int, pontos_gdf: gpd.GeoDataFrame, state: GraphState):
+    def _shorten_line_start(self, line_id: int, pontos_df: pd.DataFrame, state: GraphState):
         """
         Opera no 'state' para remover o primeiro vértice de uma rua.
         """
         # Encurta a geometria da rua (em ambos os GDFs de ruas)
-        new_geom = LineString(pontos_gdf.geometry.iloc[1:].values)
-        state.data_streets.loc[state.data_streets['id'] == line_id, 'geometry'] = new_geom
-        state.map_streets.loc[state.map_streets['id'] == line_id, 'geometry'] = new_geom
+        new_geom = LineString(pontos_df.geometry.iloc[1:].values)
+
+        mask = state.data_streets['id'] == line_id
+        state.data_streets.loc[mask, 'geometry'] = new_geom
         
-        # Re-indexa os pontos restantes (somente no GDF de dados)
-        for i, idx in enumerate(pontos_gdf.index[1:]):      # Itera do segundo ponto em diante
-            state.data_points.loc[idx, 'vertex_index'] = i
-            state.data_points.loc[idx, 'vertex_to'] = i
+        mask_map = state.map_streets['id'] == line_id
+        state.map_streets.loc[mask_map, 'geometry'] = new_geom
+        
+        # Re-indexa os pontos restantes
+        for i, idx in enumerate(pontos_df.index[1:]):      # Itera do segundo ponto em diante
+            state.data_points.at[idx, 'vertex_index'] = i
+            state.data_points.at[idx, 'vertex_to'] = i
             
             if i == 0:      # Este é o NOVO ponto inicial
-                state.data_points.loc[idx, 'distance'] = 0.0
-                state.data_points.loc[idx, 'eh_extremidade'] = 'yes'
+                state.data_points.at[idx, 'distance'] = 0.0
+                state.data_points.at[idx, 'eh_extremidade'] = 'yes'
 
-    def _shorten_line_end(self, line_id: int, pontos_gdf: gpd.GeoDataFrame, state: GraphState):
+    def _shorten_line_end(self, line_id: int, pontos_df: pd.DataFrame, state: GraphState):
         """
         Opera no 'state' para remover o último vértice de uma rua.
         """
         # Encurta a geometria da rua (em ambos os GDFs de ruas)
-        new_geom = LineString(pontos_gdf.geometry.iloc[:-1].values)
-        state.data_streets.loc[state.data_streets['id'] == line_id, 'geometry'] = new_geom
-        state.map_streets.loc[state.map_streets['id'] == line_id, 'geometry'] = new_geom
+        new_geom = LineString(pontos_df.geometry.iloc[:-1].values)
+
+        mask = state.data_streets['id'] == line_id
+        state.data_streets.loc[mask, 'geometry'] = new_geom
+        
+        mask_map = state.map_streets['id'] == line_id
+        state.map_streets.loc[mask_map, 'geometry'] = new_geom
         
         # Atualiza o NOVO ponto final
-        new_end_idx = pontos_gdf.index[-2]      # O penúltimo ponto
-        state.data_points.loc[new_end_idx, 'eh_extremidade'] = 'yes'
+        new_end_idx = pontos_df.index[-2]      # O penúltimo ponto
+        state.data_points.at[new_end_idx, 'eh_extremidade'] = 'yes'
         # Limpa ângulo (não tem ponto seguinte)
         state.data_points.loc[new_end_idx, ['angle', 'angle_inv']] = None
 

@@ -49,6 +49,7 @@ class MCGRPTPInstanceGenerator(InstanceGenerator):
         # Salvar arquivo
         root_dir = Path(__file__).resolve().parent.parent.parent.parent.parent
         output_dir = root_dir / "instancias"
+        output_dir.mkdir(exist_ok=True, parents=True)
         output_path = output_dir / f"{instance_name}-TP.dat"
 
         return self._save_instance(output_path, lines)
@@ -70,54 +71,84 @@ class MCGRPTPInstanceGenerator(InstanceGenerator):
             "arcs": []
         }
 
+        def get_val(row, attr, default=None):
+            return getattr(row, attr, default)
+        
+        def safe_int(val):
+            if pd.isna(val): return 0
+            try: return int(val)
+            except: return 0
+
         # Nós
-        if self.state.map_points is not None:
+        if self.state.map_points is not None and not self.state.map_points.empty:
             sorted_nodes = self.state.map_points.sort_values('node_index')
             
-            for _, row in sorted_nodes.iterrows():
-                props = row.to_dict()
-                node_idx = int(props.get("node_index", 0))
+            for row in sorted_nodes.itertuples():
+                node_idx_raw = get_val(row, "node_index")
+                if pd.isna(node_idx_raw): continue
+                
+                node_idx = int(node_idx_raw)
+                
+                props = {
+                    "node_index": node_idx,
+                    "depot": get_val(row, "depot"),
+                    "eh_requerido": get_val(row, "eh_requerido"),
+                    "custo_servico": safe_int(get_val(row, "custo_servico")),
+                    "demanda": safe_int(get_val(row, "demanda"))
+                }
 
                 stats["max_node"] = max(stats["max_node"], node_idx)
                 stats["nodes"].append(props)
 
-                if props.get("depot") == "yes":
+                if props["depot"] == "yes":
                     stats["depot_node"] = node_idx
 
-                if props.get("eh_requerido") == "yes" and props.get("depot") != "yes":
+                if props["eh_requerido"] == "yes" and props["depot"] != "yes":
                     stats["req_nodes"].append(props)
-                    stats["total_service_cost"] += int(props.get("custo_servico", 0))
-                    stats["total_demand"] += int(props.get("demanda", 0))
+                    stats["total_service_cost"] += props["custo_servico"]
+                    stats["total_demand"] += props["demanda"]
 
         # Ruas
-        if self.state.data_streets is not None:
+        if self.state.data_streets is not None and not self.state.data_streets.empty:
             sorted_streets = self.state.data_streets.sort_values('id')
             
-            for _, row in sorted_streets.iterrows():
-                props = row.to_dict()
-                edge_idx = props.get("edge_index")
-                arc_idx = props.get("arc_index")
+            for row in sorted_streets.itertuples():
+                edge_idx = get_val(row, "edge_index")
+                arc_idx = get_val(row, "arc_index")
                 
-                is_edge = pd.notna(edge_idx) and int(edge_idx) != -1
-                is_arc = pd.notna(arc_idx) and int(arc_idx) != -1
+                is_edge = pd.notna(edge_idx) and edge_idx != -1
+                is_arc = pd.notna(arc_idx) and arc_idx != -1
+
+                if not is_edge and not is_arc: continue
+
+                props = {
+                    "edge_index": safe_int(edge_idx) if is_edge else None,
+                    "arc_index": safe_int(arc_idx) if is_arc else None,
+                    "from_node": safe_int(get_val(row, "from_node")),
+                    "to_node": safe_int(get_val(row, "to_node")),
+                    "custo_travessia": safe_int(get_val(row, "custo_travessia")),
+                    "custo_servico": safe_int(get_val(row, "custo_servico")),
+                    "demanda": safe_int(get_val(row, "demanda")),
+                    "eh_requerido": get_val(row, "eh_requerido", "no")
+                }
 
                 if is_edge:
-                    e_idx = int(edge_idx)
+                    e_idx = props["edge_index"]
                     stats["max_edge"] = max(stats["max_edge"], e_idx)
                     stats["edges"].append(props)
-                    if props.get("eh_requerido") == "yes":
+                    if props["eh_requerido"] == "yes":
                         stats["req_edges"].append(props)
-                        stats["total_service_cost"] += int(props.get("custo_servico", 0))
-                        stats["total_demand"] += int(props.get("demanda", 0))
+                        stats["total_service_cost"] += props["custo_servico"]
+                        stats["total_demand"] += props["demanda"]
 
                 elif is_arc:
-                    a_idx = int(arc_idx)
+                    a_idx = props["arc_index"]
                     stats["max_arc"] = max(stats["max_arc"], a_idx)
                     stats["arcs"].append(props)
-                    if props.get("eh_requerido") == "yes":
+                    if props["eh_requerido"] == "yes":
                         stats["req_arcs"].append(props)
-                        stats["total_service_cost"] += int(props.get("custo_servico", 0))
-                        stats["total_demand"] += int(props.get("demanda", 0))
+                        stats["total_service_cost"] += props["custo_servico"]
+                        stats["total_demand"] += props["demanda"]
 
         return stats
 
@@ -130,12 +161,20 @@ class MCGRPTPInstanceGenerator(InstanceGenerator):
         self._generate_and_process_triplets()
 
     def _preprocess_data_structures(self):
-        """Pré-processa estruturas auxiliares a partir dos GDFs."""
+        """Pré-processa estruturas auxiliares a partir dos DataFrames."""
+        
+        def get_val(row, attr, default=None):
+            return getattr(row, attr, default)
         
         # Indexar Ruas por Nós
-        if self.state.data_streets is not None:
-            for _, row in self.state.data_streets.iterrows():
-                props = row.to_dict()
+        if self.state.data_streets is not None and not self.state.data_streets.empty:
+            for row in self.state.data_streets.itertuples():
+                props = {
+                    "from_node": get_val(row, "from_node"),
+                    "to_node": get_val(row, "to_node"),
+                    "edge_index": get_val(row, "edge_index")
+                }
+                
                 u = int(props["from_node"])
                 v = int(props["to_node"])
                 
@@ -147,42 +186,38 @@ class MCGRPTPInstanceGenerator(InstanceGenerator):
                     self.line_features_by_nodes[(v, u)] = props
 
         # Indexar Ângulos
-        if self.state.data_points is not None:
-            # Filtra pontos que podem ser início de segmento:
-            # 1. Pontos originais (vertex_index == 0)
-            # 2. Pontos novos inseridos (vertex_index == -1)
+        if self.state.data_points is not None and not self.state.data_points.empty:
+            # Filtra pontos relevantes
             candidates = self.state.data_points[
                 self.state.data_points['vertex_index'].isin([0, 0.0, -1, -1.0])
             ]
             
-            for _, row in candidates.iterrows():
-                # Verificação de segurança para vertex_index -1
-                v_idx = int(row.get('vertex_index', -999))
-                angle = row.get('angle')
-                angle_inv = row.get('angle_inv')
-                
-                # Se for nó inserido (-1), verifica se os ângulos são válidos (não nulos e não zero)
-                if v_idx == -1:
-                    is_angle_valid = (angle is not None and not pd.isna(angle) and float(angle) != 0.0)
-                    is_angle_inv_valid = (angle_inv is not None and not pd.isna(angle_inv) and float(angle_inv) != 0.0)
-                    
-                    if not (is_angle_valid or is_angle_inv_valid):
-                        continue
+            if not candidates.empty:
+                # Mapa local line_id -> (u, v)
+                line_to_nodes = dict(zip(self.state.data_streets['id'], zip(self.state.data_streets['from_node'], self.state.data_streets['to_node'])))
 
-                line_id = row['from_line_id']
-                
-                # Encontra u e v para esta linha
-                street_rows = self.state.data_streets[self.state.data_streets['id'] == line_id]
-                if street_rows.empty: continue
-                
-                street = street_rows.iloc[0]
-                u, v = int(street['from_node']), int(street['to_node'])
-                
-                # Armazena
-                if pd.notna(angle):
-                    self.edge_angles[(u, v)] = float(angle)
-                if pd.notna(angle_inv):
-                    self.edge_angles_inv[(u, v)] = float(angle_inv)
+                for row in candidates.itertuples():
+                    v_idx = int(get_val(row, 'vertex_index', -999))
+                    angle = get_val(row, 'angle')
+                    angle_inv = get_val(row, 'angle_inv')
+                    
+                    # Validação de ângulos para nós inseridos (-1)
+                    if v_idx == -1:
+                        is_angle_valid = (angle is not None and not pd.isna(angle) and float(angle) != 0.0)
+                        is_angle_inv_valid = (angle_inv is not None and not pd.isna(angle_inv) and float(angle_inv) != 0.0)
+                        if not (is_angle_valid or is_angle_inv_valid):
+                            continue
+
+                    line_id = get_val(row, 'from_line_id')
+                    if line_id not in line_to_nodes: continue
+                    
+                    u, v = line_to_nodes[line_id]
+                    u, v = int(u), int(v)
+
+                    if pd.notna(angle):
+                        self.edge_angles[(u, v)] = float(angle)
+                    if pd.notna(angle_inv):
+                        self.edge_angles_inv[(u, v)] = float(angle_inv)
 
     def _get_precomputed_angle(self, from_node: int, to_node: int) -> Optional[float]:
         """Obtém o azimute da rua saindo de from_node em direção a to_node."""
@@ -204,7 +239,7 @@ class MCGRPTPInstanceGenerator(InstanceGenerator):
             feat = self.line_features_by_nodes[(to_node, from_node)]
 
             # Se é aresta, podemos transitar no sentido inverso
-            if feat.get("edge_index") is not None:
+            if feat.get("edge_index") is not None and pd.notna(feat.get("edge_index")) and feat.get("edge_index") != -1:
                 return self.edge_angles_inv.get((from_node, to_node))
         
         return None

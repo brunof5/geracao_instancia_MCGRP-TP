@@ -1,7 +1,6 @@
 # src\mcgrp_app\core\processing\exploder.py
 
 import numpy as np
-import geopandas as gpd
 import pandas as pd
 from shapely.geometry import Point
 
@@ -27,7 +26,7 @@ class PointExploder:
         
         return state
     
-    def _explode_linestrings(self, data_streets_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    def _explode_linestrings(self, data_streets_df: pd.DataFrame) -> pd.DataFrame:
         """
         Método principal: Executa a explosão de LineString para Point.
         """
@@ -35,31 +34,44 @@ class PointExploder:
         
         all_points_data = []
         
-        # Itera sobre o GDF de dados (lógico)
-        for row in data_streets_gdf.itertuples():
+        # Itera sobre o DataFrame de dados (lógico)
+        for row in data_streets_df.itertuples():
             all_points_data.extend(
                 self._create_points_from_linestring(row)
             )
             
-        # Cria o GDF de dados de pontos
-        data_points_gdf = gpd.GeoDataFrame(
-            [p[1] for p in all_points_data],                # Lista de dicts de propriedades
-            geometry=[p[0] for p in all_points_data],       # Lista de geometrias Point
-            crs=data_streets_gdf.crs
-        )
-        
-        return data_points_gdf
+        # Separa geometria de propriedades para criar o DataFrame de forma eficiente
+        if not all_points_data:
+            return pd.DataFrame(columns=['geometry'])
 
-    def _create_points_from_linestring(self, street_row: pd.Series) -> list:
+        geometries = [p[0] for p in all_points_data]
+        properties = [p[1] for p in all_points_data]
+        
+        # Cria o DataFrame de dados de pontos
+        data_points_df = pd.DataFrame(properties)
+        data_points_df['geometry'] = geometries
+        
+        return data_points_df
+
+    def _create_points_from_linestring(self, street_row: any) -> list:
         """
         Cria uma lista de (Geometria, Propriedades) para cada vértice
-        em uma única rua (linha do GDF).
+        em uma única rua.
         """
         points_list = []
-        line_props = street_row
+        line_geom = street_row.geometry
         line_id = street_row.id
+
+        # Helper para pegar atributo com segurança ou padrão, caso a coluna não exista
+        def get_attr(row, attr, default=None):
+            return getattr(row, attr, default)
+
+        name = get_attr(street_row, 'name')
+        alt_name = get_attr(street_row, 'alt_name')
+        id_bairro = get_attr(street_row, 'id_bairro')
+        bairro = get_attr(street_row, 'bairro')
         
-        for idx, coord in enumerate(line_props.geometry.coords):
+        for idx, coord in enumerate(line_geom.coords):
             # Obtém o dicionário de padrões
             point_props = FieldsManager.get_point_basic_fields()
             
@@ -68,10 +80,10 @@ class PointExploder:
             point_props["vertex_index"] = idx
             
             # Copia propriedades herdadas
-            point_props["name"] = line_props.name
-            point_props["alt_name"] = line_props.alt_name
-            point_props["id_bairro"] = line_props.id_bairro
-            point_props["bairro"] = line_props.bairro
+            point_props["name"] = name
+            point_props["alt_name"] = alt_name
+            point_props["id_bairro"] = id_bairro
+            point_props["bairro"] = bairro
             
             point_geom = Point(coord)
             points_list.append((point_geom, point_props))
@@ -86,14 +98,14 @@ class PointExploder:
         print("  Rotulando vértices 'unidos'...")
         
         # Cria uma coluna 'coord_tuple' para agrupamento preciso
-        state.data_points['coord_tuple'] = state.data_points.geometry.apply(
+        state.data_points['coord_tuple'] = state.data_points['geometry'].apply(
             lambda p: tuple(np.round(p.coords[0], GeoCalculator.PRECISION_DIGITS))
         )
         
         # Agrupa por coordenada
         grouped = state.data_points.groupby('coord_tuple')
         
-        # 'transform' aplica o resultado de volta ao GDF original
+        # 'transform' aplica o resultado de volta ao DF original
         # 'count' conta o número total de pontos em cada grupo de coordenadas
         point_counts = grouped['from_line_id'].transform('count')
         
@@ -128,7 +140,7 @@ class PointExploder:
             sorted_points = group.sort_values(by='vertex_index')
             
             # Converte para tuplas (lon, lat) para o GeoCalculator
-            coords = [tuple(p.coords[0]) for p in sorted_points.geometry]
+            coords = [tuple(p.coords[0]) for p in sorted_points['geometry']]
             
             # Converte o grupo em uma lista de dicionários
             group_rows = sorted_points.to_dict('records')
@@ -170,18 +182,15 @@ class PointExploder:
             # Salva a distância total (em metros)
             total_dists_map[line_id] = total_dist_m
 
-        # Reconstrói o GDF
-        state.data_points = gpd.GeoDataFrame(
-            processed_rows, 
-            crs=state.data_points.crs
-        )
+        # Reconstrói o DF
+        state.data_points = pd.DataFrame(processed_rows)
         
         # Obtém o mapa de distâncias (metros) e converte para km
         total_dists_km = pd.Series(total_dists_map).map(
             lambda m: m / 1000
         ).round(GeoCalculator.PRECISION_DIGITS)
         
-        # Mapeia a 'total_dist' de volta para os GDFs de ruas
+        # Mapeia a 'total_dist' de volta para os DFs de ruas
         state.data_streets['total_dist'] = state.data_streets['id'].map(total_dists_km)
         state.map_streets['total_dist'] = state.map_streets['id'].map(total_dists_km)
 

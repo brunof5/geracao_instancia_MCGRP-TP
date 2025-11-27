@@ -31,12 +31,13 @@ class MCGRPInstanceGenerator(InstanceGenerator):
         # Salvar arquivo
         root_dir = Path(__file__).resolve().parent.parent.parent.parent.parent
         output_dir = root_dir / "instancias"
+        output_dir.mkdir(exist_ok=True, parents=True)       # garante que a pasta existe
         output_path = output_dir / f"{instance_name}.dat"
 
         return self._save_instance(output_path, lines)
 
     def _collect_statistics(self) -> Dict:
-        """Coleta estatísticas completas dos GeoDataFrames para formato MCGRP."""
+        """Coleta estatísticas completas dos DataFrames para formato MCGRP."""
         stats = {
             "total_service_cost": 0,
             "total_demand": 0,
@@ -51,63 +52,94 @@ class MCGRPInstanceGenerator(InstanceGenerator):
             "non_req_arcs": []
         }
 
+        # Helpers para extração de dados
+        def get_val(row, attr, default=None):
+            return getattr(row, attr, default)
+        
+        def safe_int(val):
+            if pd.isna(val): return 0
+            try:
+                return int(val)
+            except:
+                return 0
+
         # Processar nós (Points)
-        if self.state.map_points is not None:
-            for _, row in self.state.map_points.iterrows():
-                props = row.to_dict()
+        if self.state.map_points is not None and not self.state.map_points.empty:
+            for row in self.state.map_points.itertuples():
+                node_idx_raw = get_val(row, "node_index")
+                if pd.isna(node_idx_raw): continue
                 
-                node_idx = int(props.get("node_index", 0))
+                node_idx = int(node_idx_raw)
                 stats["max_node"] = max(stats["max_node"], node_idx)
 
                 # Verificar depósito
-                if props.get("depot") == "yes":
+                if get_val(row, "depot") == "yes":
                     stats["depot_node"] = node_idx
 
-                # Coletar nós requeridos
-                # Nota: Depósito nunca é requerido como tarefa, mas verificamos 'eh_requerido'
-                if props.get("eh_requerido") == "yes" and props.get("depot") != "yes":
+                # Coletar nós requeridos (Depósito não entra aqui)
+                if get_val(row, "eh_requerido") == "yes" and get_val(row, "depot") != "yes":
+                    props = {
+                        "node_index": node_idx,
+                        "demanda": safe_int(get_val(row, "demanda")),
+                        "custo_servico": safe_int(get_val(row, "custo_servico"))
+                    }
                     stats["req_nodes"].append(props)
-                    stats["total_service_cost"] += int(props.get("custo_servico", 0))
-                    stats["total_demand"] += int(props.get("demanda", 0))
+                    stats["total_service_cost"] += props["custo_servico"]
+                    stats["total_demand"] += props["demanda"]
 
         # Processar ruas (Streets)
-        if self.state.data_streets is not None:
-            for _, row in self.state.data_streets.iterrows():
-                props = row.to_dict()
+        if self.state.data_streets is not None and not self.state.data_streets.empty:
+            for row in self.state.data_streets.itertuples():
+                edge_idx = get_val(row, "edge_index")
+                arc_idx = get_val(row, "arc_index")
                 
-                edge_idx = props.get("edge_index")
-                arc_idx = props.get("arc_index")
+                # Tratamento para Int64/Nullable
+                is_edge = pd.notna(edge_idx) and edge_idx != -1
+                is_arc = pd.notna(arc_idx) and arc_idx != -1
                 
-                # Tratamento de NaN/None para índices
-                is_edge = pd.notna(edge_idx) and int(edge_idx) != -1
-                is_arc = pd.notna(arc_idx) and int(arc_idx) != -1
+                if not is_edge and not is_arc:
+                    continue
+
+                # Propriedades comuns
+                props = {
+                    "from_node": safe_int(get_val(row, "from_node")),
+                    "to_node": safe_int(get_val(row, "to_node")),
+                    "custo_travessia": safe_int(get_val(row, "custo_travessia")),
+                    "custo_servico": safe_int(get_val(row, "custo_servico")),
+                    "demanda": safe_int(get_val(row, "demanda")),
+                    "eh_requerido": get_val(row, "eh_requerido", "no")
+                }
 
                 if is_edge:
                     e_idx = int(edge_idx)
+                    props["edge_index"] = e_idx
                     stats["max_edge"] = max(stats["max_edge"], e_idx)
-                    if props.get("eh_requerido") == "yes":
+                    
+                    if props["eh_requerido"] == "yes":
                         stats["req_edges"].append(props)
-                        stats["total_service_cost"] += int(props.get("custo_servico", 0))
-                        stats["total_demand"] += int(props.get("demanda", 0))
+                        stats["total_service_cost"] += props["custo_servico"]
+                        stats["total_demand"] += props["demanda"]
                     else:
                         stats["non_req_edges"].append(props)
 
                 elif is_arc:
                     a_idx = int(arc_idx)
+                    props["arc_index"] = a_idx
                     stats["max_arc"] = max(stats["max_arc"], a_idx)
-                    if props.get("eh_requerido") == "yes":
+                    
+                    if props["eh_requerido"] == "yes":
                         stats["req_arcs"].append(props)
-                        stats["total_service_cost"] += int(props.get("custo_servico", 0))
-                        stats["total_demand"] += int(props.get("demanda", 0))
+                        stats["total_service_cost"] += props["custo_servico"]
+                        stats["total_demand"] += props["demanda"]
                     else:
                         stats["non_req_arcs"].append(props)
 
-        # Ordena as listas para garantir consistência no arquivo
-        stats["req_nodes"].sort(key=lambda x: int(x["node_index"]))
-        stats["req_edges"].sort(key=lambda x: int(x["edge_index"]))
-        stats["non_req_edges"].sort(key=lambda x: int(x["edge_index"]))
-        stats["req_arcs"].sort(key=lambda x: int(x["arc_index"]))
-        stats["non_req_arcs"].sort(key=lambda x: int(x["arc_index"]))
+        # Ordena as listas para garantir consistência e determinismo no arquivo
+        stats["req_nodes"].sort(key=lambda x: x["node_index"])
+        stats["req_edges"].sort(key=lambda x: x["edge_index"])
+        stats["non_req_edges"].sort(key=lambda x: x["edge_index"])
+        stats["req_arcs"].sort(key=lambda x: x["arc_index"])
+        stats["non_req_arcs"].sort(key=lambda x: x["arc_index"])
 
         return stats
 
@@ -134,9 +166,9 @@ class MCGRPInstanceGenerator(InstanceGenerator):
         if self.stats["req_nodes"]:
             for props in self.stats["req_nodes"]:
                 lines.append(
-                    f"N{int(props['node_index'])}\t"
-                    f"{int(props.get('demanda', 0))}\t"
-                    f"{int(props.get('custo_servico', 0))}"
+                    f"N{props['node_index']}\t"
+                    f"{props['demanda']}\t"
+                    f"{props['custo_servico']}"
                 )
         lines.append("")
         return lines
@@ -147,12 +179,12 @@ class MCGRPInstanceGenerator(InstanceGenerator):
         if self.stats["req_edges"]:
             for props in self.stats["req_edges"]:
                 lines.append(
-                    f"E{int(props['edge_index'])}\t"
-                    f"{int(props['from_node'])}\t"
-                    f"{int(props['to_node'])}\t"
-                    f"{int(props.get('custo_travessia', 0))}\t"
-                    f"{int(props.get('demanda', 0))}\t"
-                    f"{int(props.get('custo_servico', 0))}"
+                    f"E{props['edge_index']}\t"
+                    f"{props['from_node']}\t"
+                    f"{props['to_node']}\t"
+                    f"{props['custo_travessia']}\t"
+                    f"{props['demanda']}\t"
+                    f"{props['custo_servico']}"
                 )
         lines.append("")
         return lines
@@ -163,10 +195,10 @@ class MCGRPInstanceGenerator(InstanceGenerator):
         if self.stats["non_req_edges"]:
             for props in self.stats["non_req_edges"]:
                 lines.append(
-                    f"NrE{int(props['edge_index'])}\t"
-                    f"{int(props['from_node'])}\t"
-                    f"{int(props['to_node'])}\t"
-                    f"{int(props.get('custo_travessia', 0))}"
+                    f"NrE{props['edge_index']}\t"
+                    f"{props['from_node']}\t"
+                    f"{props['to_node']}\t"
+                    f"{props['custo_travessia']}"
                 )
         lines.append("")
         return lines
@@ -177,12 +209,12 @@ class MCGRPInstanceGenerator(InstanceGenerator):
         if self.stats["req_arcs"]:
             for props in self.stats["req_arcs"]:
                 lines.append(
-                    f"A{int(props['arc_index'])}\t"
-                    f"{int(props['from_node'])}\t"
-                    f"{int(props['to_node'])}\t"
-                    f"{int(props.get('custo_travessia', 0))}\t"
-                    f"{int(props.get('demanda', 0))}\t"
-                    f"{int(props.get('custo_servico', 0))}"
+                    f"A{props['arc_index']}\t"
+                    f"{props['from_node']}\t"
+                    f"{props['to_node']}\t"
+                    f"{props['custo_travessia']}\t"
+                    f"{props['demanda']}\t"
+                    f"{props['custo_servico']}"
                 )
         lines.append("")
         return lines
@@ -193,9 +225,9 @@ class MCGRPInstanceGenerator(InstanceGenerator):
         if self.stats["non_req_arcs"]:
             for props in self.stats["non_req_arcs"]:
                 lines.append(
-                    f"NrA{int(props['arc_index'])}\t"
-                    f"{int(props['from_node'])}\t"
-                    f"{int(props['to_node'])}\t"
-                    f"{int(props.get('custo_travessia', 0))}"
+                    f"NrA{props['arc_index']}\t"
+                    f"{props['from_node']}\t"
+                    f"{props['to_node']}\t"
+                    f"{props['custo_travessia']}"
                 )
         return lines

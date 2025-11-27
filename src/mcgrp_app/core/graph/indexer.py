@@ -1,10 +1,9 @@
 # src\mcgrp_app\core\graph\indexer.py
 
-import math
 import numpy as np
 import pandas as pd
 
-from ..utils import FieldConfigType, FieldsManager,  GeoCalculator, GraphState
+from ..utils import FieldConfigType, FieldsManager, GeoCalculator, GraphState
 
 class GraphIndexer:
     """
@@ -22,7 +21,7 @@ class GraphIndexer:
         # Limpa índices/custos antigos
         state = self._reset_indices(state)
         
-        # Filtra GDFs por bairros válidos
+        # Filtra DataFrames por bairros válidos
         state = self._prepare_valid_features(state)
         
         # Atribui node_index (1-N)
@@ -68,17 +67,17 @@ class GraphIndexer:
             
         for col in cols_to_reset_points:
             state.data_points[col] = None
-            # map_points_gdf será reconstruído depois
+            # map_points será reconstruído depois
 
         return state
 
     def _prepare_valid_features(self, state: GraphState) -> GraphState:
-        """Filtra os GDFs com base nos bairros válidos."""
+        """Filtra os DataFrames com base nos bairros válidos."""
         if self.valid_neighborhoods is None:
             print("  Indexer: 'valid_neighborhoods' é None. Todos os bairros são válidos.")
             return state
 
-        print(f"  Indexer: Filtrando GDFs por {len(self.valid_neighborhoods)} bairros válidos...")
+        print(f"  Indexer: Filtrando DataFrames por {len(self.valid_neighborhoods)} bairros válidos...")
         
         # Filtra ruas e pontos
         state.data_streets = state.data_streets[
@@ -104,7 +103,7 @@ class GraphIndexer:
         print("  Indexer: Atribuindo 'node_index'...")
         
         # Cria 'coord_tuple' para agrupamento
-        state.data_points['coord_tuple'] = state.data_points.geometry.apply(
+        state.data_points['coord_tuple'] = state.data_points['geometry'].apply(
             lambda p: tuple(np.round(p.coords[0], GeoCalculator.PRECISION_DIGITS))
         )
         
@@ -116,13 +115,13 @@ class GraphIndexer:
             coord: idx + 1 for idx, coord in enumerate(unique_coords)
         }
         
-        #Mapeia o 'node_index' para o GDF de dados
+        # Mapeia o 'node_index' para o DataFrame de dados
         state.data_points['node_index'] = state.data_points['coord_tuple'].map(coords_to_node_map)
 
         state.data_points = state.data_points.drop(columns='coord_tuple')
         
-        # Reconstrói o GDF de mapa (visual)
-        print("  Indexer: Reconstruindo GDF de pontos de mapa (para 'node_index')...")
+        # Reconstrói o DataFrame de mapa (visual)
+        print("  Indexer: Reconstruindo DataFrame de pontos de mapa (para 'node_index')...")
         state.map_points = GeoCalculator.create_map_points(state.data_points)
 
         return state
@@ -131,43 +130,58 @@ class GraphIndexer:
         """Atribui 'edge_index' (bidirecional) e 'arc_index' (unidirecional)."""
         print("  Indexer: Atribuindo 'edge_index' e 'arc_index'...")
         
-        for gdf in [state.data_streets, state.map_streets]:
+        for df in [state.data_streets, state.map_streets]:
+            if df.empty: continue
+
             # Normaliza 'oneway' (None, NaN, 'não' -> 'no')
-            oneway = gdf['oneway'].fillna('no').astype(str).str.lower()
+            oneway = df['oneway'].fillna('no').astype(str).str.lower()
             is_arc = (oneway == 'yes') | (oneway == '1') | (oneway == 'true')
             
-            # Cria índices 1-N para cada grupo
-            gdf.loc[~is_arc, 'edge_index'] = (~is_arc).cumsum()
-            gdf.loc[is_arc, 'arc_index'] = is_arc.cumsum()
+            # Cria máscaras booleanas para atribuição
+            n_edges = (~is_arc).sum()
+            n_arcs = is_arc.sum()
+            
+            # Inicializa com NA
+            df['edge_index'] = pd.NA
+            df['arc_index'] = pd.NA
+            
+            if n_edges > 0:
+                df.loc[~is_arc, 'edge_index'] = range(1, n_edges + 1)
+            
+            if n_arcs > 0:
+                df.loc[is_arc, 'arc_index'] = range(1, n_arcs + 1)
             
             # Converte para Int64
-            gdf['edge_index'] = gdf['edge_index'].astype('Int64')
-            gdf['arc_index'] = gdf['arc_index'].astype('Int64')
+            df['edge_index'] = df['edge_index'].astype('Int64')
+            df['arc_index'] = df['arc_index'].astype('Int64')
         
         return state
 
     def _link_nodes_to_edges(self, state: GraphState) -> GraphState:
         """Define 'from_node' e 'to_node' nas ruas."""
         print("  Indexer: Vinculando 'from_node' e 'to_node'...")
+
+        if state.data_points.empty or state.data_streets.empty:
+            return state
         
-        # Cria um mapa {from_line_id -> {vertex_index -> node_index}}
-        node_map = {}
-        for row in state.data_points.itertuples():
-            line_id = row.from_line_id
-            if line_id not in node_map:
-                node_map[line_id] = {}
-            node_map[line_id][row.vertex_index] = row.node_index
+        # Extrai mapeamento de pontos: from_line_id -> node_index
+        # Considera-se vertex_index=0 como INÍCIO e vertex_index=1 como FIM (pós-splitter)
+
+        # Filtra pontos de início
+        start_points = state.data_points[state.data_points['vertex_index'] == 0]
+        # Cria série: index=from_line_id, value=node_index
+        start_map = start_points.set_index('from_line_id')['node_index']
         
-        # Mapeia para os GDFs de ruas
-        def get_from_node(row):
-            return node_map.get(row['id'], {}).get(0)
+        # Filtra pontos de fim (assumindo segmentos de 2 pontos, index 1)
+        end_points = state.data_points[state.data_points['vertex_index'] == 1]
+        end_map = end_points.set_index('from_line_id')['node_index']
+        
+        for df in [state.data_streets, state.map_streets]:
+            if df.empty: continue
             
-        def get_to_node(row):
-            return node_map.get(row['id'], {}).get(1)
-            
-        for gdf in [state.data_streets, state.map_streets]:
-            gdf['from_node'] = gdf.apply(get_from_node, axis=1).astype('Int64')
-            gdf['to_node'] = gdf.apply(get_to_node, axis=1).astype('Int64')
+            # Mapeia usando o ID da rua
+            df['from_node'] = df['id'].map(start_map).astype('Int64')
+            df['to_node'] = df['id'].map(end_map).astype('Int64')
 
         return state
 
@@ -175,19 +189,26 @@ class GraphIndexer:
         """Calcula 'custo_travessia' e 'custo_servico'."""
         print("  Indexer: Calculando custos de travessia e serviço...")
         
-        for gdf in [state.data_streets, state.map_streets]:
-            # Custo de Travessia
-            gdf['custo_travessia'] = gdf.apply(
-                lambda row: GeoCalculator.calculate_traversal_cost(
-                    row['total_dist'], row.get('maxspeed', '20')
-                ), 
-                axis=1
-            ).astype('Int64')
+        for df in [state.data_streets, state.map_streets]:
+            if df.empty: continue
+
+            # Extrai números da string de velocidade '30 km/h' -> 30.0
+            # Preenche NaNs com DEFAULT
+            speeds = df['maxspeed'].astype(str).str.extract(r'(\d+)')[0].astype(float)
+            speeds = speeds.fillna(GeoCalculator.DEFAULT_MAX_SPEED)
+            speeds = speeds.replace(0, GeoCalculator.DEFAULT_MAX_SPEED)
             
-            # Custo de Serviço
-            gdf['custo_servico'] = (gdf['custo_travessia'] * 1.5).apply(
-                lambda x: math.ceil(x) if pd.notna(x) else None
-            ).astype('Int64')
+            # Garante que distâncias sejam float
+            dists = df['total_dist'].astype(float).fillna(0)
+            
+            speeds = speeds.clip(upper=GeoCalculator.DEFAULT_MAX_SPEED)
+            costs_seconds = (dists / speeds * 3600).fillna(0)
+            
+            # Arredonda para cima e converte para Int64
+            df['custo_travessia'] = np.ceil(costs_seconds).astype('Int64')
+            
+            # Custo Serviço = 1.5 * Travessia
+            df['custo_servico'] = np.ceil(df['custo_travessia'] * 1.5).astype('Int64')
 
         return state
 
@@ -205,7 +226,7 @@ class GraphIndexer:
         
         if invalid_street_ids:
             print(f"  Removendo {len(invalid_street_ids)} ruas inválidas.")
-            # Remove de ambos os GDFs de ruas
+            # Remove de ambos os DataFrames de ruas
             state.data_streets = state.data_streets[~invalid_streets_mask].copy()
             state.map_streets = state.map_streets[
                 ~state.map_streets['id'].isin(invalid_street_ids)

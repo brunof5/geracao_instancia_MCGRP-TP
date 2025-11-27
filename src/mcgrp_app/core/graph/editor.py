@@ -1,10 +1,8 @@
 # src\mcgrp_app\core\editing.py
 
-from typing import Any, Dict, List
 import pandas as pd
-import geopandas as gpd
+from typing import List, Tuple
 from shapely.geometry import Point, LineString
-from shapely.geometry.base import BaseGeometry
 
 from ..utils import FieldConfigType, FieldsManager, GeoCalculator, GraphState
 
@@ -16,68 +14,19 @@ class GraphEditor:
 
     def __init__(self):
         pass
-
-    def _sanitize_and_build_gdf(self, df: pd.DataFrame, crs: Any) -> gpd.GeoDataFrame:
-        """
-        Reconstrói um GeoDataFrame de forma segura.
-        """
-        if df.empty:
-            gdf = gpd.GeoDataFrame(df, geometry='geometry')
-            gdf.crs = crs
-            return gdf
-
-        df = df.copy()
-
-        if 'geometry' not in df.columns:
-            raise ValueError("DataFrame não possui coluna 'geometry'.")
-
-        # Limpeza Bruta
-        df = df[df['geometry'].notna()]
-
-        # Validação de Tipo
-        valid_geom_mask = df['geometry'].apply(lambda x: isinstance(x, BaseGeometry))
-        if not valid_geom_mask.all():
-            print(f"  AVISO: Removendo {len(df) - valid_geom_mask.sum()} geometrias inválidas.")
-            df = df[valid_geom_mask]
-
-        # Reconstrução Segura
-        try:
-            # Tenta criar GeoSeries sem CRS
-            geo_series = gpd.GeoSeries(df['geometry'])
-            df_no_geom = df.drop(columns=['geometry'])
-            
-            # Cria GDF sem CRS
-            gdf = gpd.GeoDataFrame(df_no_geom, geometry=geo_series)
-            
-            # Atribui CRS com segurança
-            gdf.crs = crs
-            return gdf
-
-        except Exception:
-            # Fallback WKT
-            try:
-                wkt_series = df['geometry'].apply(lambda x: x.wkt)
-                geo_series = gpd.GeoSeries.from_wkt(wkt_series)
-                df_no_geom = df.drop(columns=['geometry'])
-                gdf = gpd.GeoDataFrame(df_no_geom, geometry=geo_series)
-                gdf.crs = crs
-                return gdf
-            except Exception as e:
-                print(f"  ERRO CRÍTICO na reconstrução do GDF: {e}")
-                # Último recurso
-                gdf = gpd.GeoDataFrame(df, geometry='geometry')
-                gdf.crs = crs
-                return gdf
     
     def _align_dataframe_structure(self, new_df: pd.DataFrame, template_df: pd.DataFrame) -> pd.DataFrame:
         """
         Garante que new_df tenha as mesmas colunas e tipos compatíveis com template_df
         antes da concatenação.
         """
+        if template_df is None or template_df.empty:
+            return new_df
+    
         # Garante que todas as colunas do template existam no novo
         for col in template_df.columns:
             if col not in new_df.columns:
-                new_df[col] = None # Ou pd.NA
+                new_df[col] = None
         
         # Ordena colunas para igualar ao template
         common_cols = [c for c in template_df.columns if c in new_df.columns]
@@ -97,11 +46,11 @@ class GraphEditor:
     def _preformat_street_tooltip(self, row_dict: dict) -> str:
         """Helper para formatar o tooltip de uma rua."""
         try:
-            oneway = (row_dict.get('oneway', 'no') or 'no').lower()
+            oneway = (str(row_dict.get('oneway', 'no')) or 'no').lower()
             if oneway in ['yes', '1', 'true']:
-                header = f"<b>Arco:</b> {int(row_dict['arc_index'])} (De: {int(row_dict['from_node'])}, Para: {int(row_dict['to_node'])})"
+                header = f"<b>Arco:</b> {row_dict.get('arc_index', '?')} (De: {row_dict.get('from_node', '?')}, Para: {row_dict.get('to_node', '?')})"
             else:
-                header = f"<b>Aresta:</b> {int(row_dict['edge_index'])}"
+                header = f"<b>Aresta:</b> {row_dict.get('edge_index', '?')}"
             
             rua = row_dict.get('name', 'desconhecida')
             bairro = row_dict.get('bairro', 'N/A')
@@ -110,8 +59,8 @@ class GraphEditor:
             dist_fmt = f"{dist_km:.3f} km"
             row_dict['total_dist_fmt'] = dist_fmt
 
-            custo_val = int(row_dict.get('custo_travessia'))
-            custo = f"{custo_val} s" if pd.notna(custo_val) and custo_val >= 0 else "N/A"
+            custo_val = row_dict.get('custo_travessia')
+            custo = f"{int(custo_val)} s" if pd.notna(custo_val) and custo_val >= 0 else "N/A"
             
             return (
                 f"{header}"
@@ -126,7 +75,9 @@ class GraphEditor:
     def _preformat_node_tooltip(self, row_dict: dict) -> str:
         """Helper para formatar o tooltip de um nó."""
         try:
-            node_idx = int(row_dict.get('node_index', '?'))
+            node_idx = row_dict.get('node_index', '?')
+            if node_idx != '?':
+                node_idx = int(node_idx)
 
             if row_dict.get('depot') == 'yes':
                 return f"<b>Depósito:</b> {node_idx}"
@@ -139,7 +90,7 @@ class GraphEditor:
         except Exception:
             return "Erro no Tooltip"
 
-    def _find_split_index_and_snapped_point(self, line_geom: LineString, click_point: Point) -> tuple[int, Point]:
+    def _find_split_index_and_snapped_point(self, line_geom: LineString, click_point: Point) -> Tuple[int, Point]:
         """
         Encontra o índice na lista de coordenadas da linha onde o novo
         ponto deve ser inserido e retorna o ponto (projetado) exato.
@@ -155,22 +106,21 @@ class GraphEditor:
             # Cria uma geometria para o segmento atual
             segment = LineString([coords[i], coords[i+1]])
             
-            # Verifica se o ponto projetado está neste segmento
-            # Usamos uma tolerância pequena para lidar com imprecisão de float
+            # Tolerância pequena para float
             if segment.distance(snapped_point) < 1e-8:
                 return i + 1, snapped_point
         
         # Fallback: se algo der errado, insere no final
         return len(coords), snapped_point
 
-    def _calculate_line_length(self, coords_list: List[tuple[float, float]]) -> float:
+    def _calculate_line_length(self, coords_list: List[Tuple[float, float]]) -> float:
         """Calcula o comprimento total (em metros) de uma lista de coordenadas."""
         total_dist = 0.0
         for i in range(len(coords_list) - 1):
             total_dist += GeoCalculator.haversine_distance(coords_list[i], coords_list[i+1])
         return total_dist
 
-    def _calculate_segment_angles(self, coords_list: List[tuple[float, float]]) -> List[float]:
+    def _calculate_segment_angles(self, coords_list: List[Tuple[float, float]]) -> List[float]:
         """Calcula o azimute de cada segmento em uma lista de coordenadas."""
         angles = []
         for i in range(len(coords_list) - 1):
@@ -186,21 +136,8 @@ class GraphEditor:
         if valid_series.empty:
             return 1
         return int(valid_series.max()) + 1
-    
-    def _add_row_from_dict(self, gdf: gpd.GeoDataFrame, row_dict: Dict[str, Any]):
-        """
-        Adiciona uma nova linha a um GeoDataFrame usando o método .loc[].
-        """
-        new_index = len(gdf)
-        # Define a geometria separadamente para garantir que o CRS seja tratado
-        gdf.loc[new_index, 'geometry'] = row_dict['geometry']
-        
-        # Define os outros valores
-        for col, val in row_dict.items():
-            if col != 'geometry' and col in gdf.columns:
-                gdf.at[new_index, col] = val
 
-    def _rebuild_and_reindex_gdfs(self, data_streets: gpd.GeoDataFrame, data_points: gpd.GeoDataFrame, map_streets: gpd.GeoDataFrame) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame]:
+    def _reindex_dfs(self, data_streets: pd.DataFrame, data_points: pd.DataFrame, map_streets: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         """
         Re-indexa os IDs das ruas (1 a N) e propaga para os pontos.
         Necessário para manter a integridade referencial após a divisão.
@@ -208,7 +145,6 @@ class GraphEditor:
         print("Editor: Re-indexando grafo...")
         
         # Ruas de DADOS
-        # Reset index para garantir sequencialidade limpa
         data_streets = data_streets.reset_index(drop=True)
         
         # Cria mapa de ID antigo -> ID novo
@@ -220,7 +156,6 @@ class GraphEditor:
         
         # Pontos
         data_points['from_line_id'] = data_points['from_line_id'].map(id_map)
-        # Remove órfãos (segurança)
         data_points = data_points.dropna(subset=['from_line_id'])
         data_points = data_points.reset_index(drop=True)
 
@@ -240,11 +175,11 @@ class GraphEditor:
         """
         print("Editor: Finalizando re-indexação completa (1..N)...")
         
-        # Re-indexação de rua
+        # 1. Re-indexação de rua
         
         # Ordena para garantir determinismo
         state.data_streets = state.data_streets.sort_values('id').reset_index(drop=True)
-        state.map_streets = state.map_streets.sort_values('id').reset_index(drop=True)      # Assume alinhamento
+        state.map_streets = state.map_streets.sort_values('id').reset_index(drop=True)
         
         # Cria mapa de IDs antigos -> novos
         old_ids = state.data_streets['id'].tolist()
@@ -253,12 +188,12 @@ class GraphEditor:
         
         # Aplica novos IDs
         state.data_streets['id'] = new_ids
-        state.map_streets['id'] = new_ids       # Assume alinhamento
+        state.map_streets['id'] = new_ids
         
         # Atualiza referências nos pontos
         state.data_points['from_line_id'] = state.data_points['from_line_id'].map(street_id_map)
         
-        # Re-indexação de Edge/Arc Index
+        # 2. Re-indexação de Edge/Arc Index
 
         # Separa arestas e arcos
         mask_edges = state.data_streets['edge_index'].notna() & (state.data_streets['edge_index'] != -1)
@@ -275,11 +210,11 @@ class GraphEditor:
         state.map_streets.loc[mask_edges, 'edge_index'] = state.data_streets.loc[mask_edges, 'edge_index'].values
         state.map_streets.loc[mask_arcs, 'arc_index'] = state.data_streets.loc[mask_arcs, 'arc_index'].values
 
-        # Re-indexação de nós
+        # 3. Re-indexação de nós
 
         # Obtém todos os node_index únicos presentes no data_points
         unique_nodes = sorted(state.data_points['node_index'].unique())
-        node_id_map = {old: new for new, old in enumerate(unique_nodes, 1)}     # 1 a N
+        node_id_map = {old: new for new, old in enumerate(unique_nodes, 1)}
         
         # Aplica mapa nos Pontos
         state.data_points['node_index'] = state.data_points['node_index'].map(node_id_map)
@@ -291,29 +226,25 @@ class GraphEditor:
         state.map_streets['from_node'] = state.map_streets['from_node'].map(node_id_map)
         state.map_streets['to_node'] = state.map_streets['to_node'].map(node_id_map)
         
-        # Reconstrói Map Points
+        # 4. Reconstrói Map Points
 
-        # Salva estado visual antigo com a chave sendo o ID antigo
+        # Salva metadados visuais antigos
         old_map_state = state.map_points[['node_index', 'eh_requerido', 'depot', 'custo_servico', 'demanda']].copy()
         old_map_state['node_index'] = old_map_state['node_index'].map(node_id_map)
-        old_map_state = old_map_state.set_index('node_index')
+        old_map_state = old_map_state.dropna(subset=['node_index']).set_index('node_index')
         
-        # Recria geometria visual
+        # Recria visualização
         final_map_points = GeoCalculator.create_map_points(state.data_points)
         final_map_points = FieldsManager.ensure_fields_exist(final_map_points, FieldConfigType.EXTENDED)
         
-        # Restaura estado visual
+        # Restaura metadados
         final_map_points = final_map_points.set_index('node_index')
         final_map_points.update(old_map_state)
         final_map_points = final_map_points.reset_index()
         
-        # Gera tooltips atualizados
+        # Tooltips
         final_map_points['tooltip_html'] = final_map_points.apply(lambda row: self._preformat_node_tooltip(row.to_dict()), axis=1)
-        
-        # Sanitiza e atribui
-        state.map_points = self._sanitize_and_build_gdf(final_map_points, state.map_streets.crs)
-        
-        # Atualiza tooltips das ruas também
+        state.map_points = final_map_points
         state.map_streets['tooltip_html'] = state.map_streets.apply(lambda row: self._preformat_street_tooltip(row.to_dict()), axis=1)
         
         print("Editor: Re-indexação final concluída.")
@@ -322,7 +253,7 @@ class GraphEditor:
     def split_street(self, state: GraphState, original_street_id: int, new_node_row_input: pd.Series, is_depot: bool = False) -> GraphState:
         """
         Divide uma rua (A-B) em duas (A-C, C-B) usando um novo nó (C).
-        Retorna um GraphState completamente novo e atualizado.
+        Retorna um GraphState com DataFrames atualizados.
         """
         
         # --- OBTER PEÇAS ---
@@ -543,81 +474,55 @@ class GraphEditor:
             'angle_inv': None
         })
         
-        # --- RECONSTRUIR GDFS DO ESTADO ---
-
-        data_streets_clean = state.data_streets[state.data_streets['id'] != original_street_id].copy()
-        map_streets_clean = state.map_streets[state.map_streets['id'] != original_street_id].copy()
-        data_points_clean = state.data_points[state.data_points['from_line_id'] != original_street_id].copy()
+        # --- ATUALIZAÇÃO DO ESTADO ---
         
-        safe_crs_s, safe_crs_m, safe_crs_p = state.data_streets.crs, state.map_streets.crs, state.data_points.crs
+        # Remove antigo
+        final_data_streets = state.data_streets[state.data_streets['id'] != original_street_id].copy()
+        final_map_streets = state.map_streets[state.map_streets['id'] != original_street_id].copy()
+        final_data_points = state.data_points[state.data_points['from_line_id'] != original_street_id].copy()
 
-        # Cria DFs
-        df_new_streets_data = pd.DataFrame([street_A_C_data, street_C_B_data])
-        dict_map_A_C = street_A_C_data.copy(); dict_map_A_C.update(street_map_row.to_dict()); dict_map_A_C.update(street_A_C_data); dict_map_A_C['geometry'] = geom_A_C_map
-        dict_map_C_B = street_C_B_data.copy(); dict_map_C_B.update(street_map_row.to_dict()); dict_map_C_B.update(street_C_B_data); dict_map_C_B['geometry'] = geom_C_B_map
-        df_new_streets_map = pd.DataFrame([dict_map_A_C, dict_map_C_B])
-        df_new_points = pd.DataFrame([pt_A1, pt_C1, pt_C2, pt_B1])
+        # Adiciona novos (concat)
+        new_streets_df = pd.DataFrame([street_A_C_data, street_C_B_data])
+        new_map_df = pd.DataFrame([street_A_C_map, street_C_B_map])
+        new_points_df = pd.DataFrame([pt_A1, pt_C1, pt_C2, pt_B1])
 
-        # Alinha estrutura
-        df_new_streets_data = self._align_dataframe_structure(df_new_streets_data, data_streets_clean)
-        df_new_streets_map = self._align_dataframe_structure(df_new_streets_map, map_streets_clean)
-        df_new_points = self._align_dataframe_structure(df_new_points, data_points_clean)
-        
-        # Cria GDFs temporários
-        gdf_temp_s = gpd.GeoDataFrame(df_new_streets_data, geometry='geometry') 
-        gdf_temp_m = gpd.GeoDataFrame(df_new_streets_map, geometry='geometry')
-        gdf_temp_p = gpd.GeoDataFrame(df_new_points, geometry='geometry')
+        new_streets_df = self._align_dataframe_structure(new_streets_df, final_data_streets)
+        new_map_df = self._align_dataframe_structure(new_map_df, final_map_streets)
+        new_points_df = self._align_dataframe_structure(new_points_df, final_data_points)
 
-        # Lobotomia
-        data_streets_clean.crs = None; gdf_temp_s.crs = None
-        map_streets_clean.crs = None; gdf_temp_m.crs = None
-        data_points_clean.crs = None; gdf_temp_p.crs = None
-
-        # Concat
-        final_data_streets_df = pd.concat([data_streets_clean, gdf_temp_s], ignore_index=True)
-        final_map_streets_df = pd.concat([map_streets_clean, gdf_temp_m], ignore_index=True)
-        final_data_points_df = pd.concat([data_points_clean, gdf_temp_p], ignore_index=True)
-
-        # Restaura
-        final_data_streets = self._sanitize_and_build_gdf(final_data_streets_df, safe_crs_s)
-        final_map_streets = self._sanitize_and_build_gdf(final_map_streets_df, safe_crs_m)
-        final_data_points = self._sanitize_and_build_gdf(final_data_points_df, safe_crs_p)
+        final_data_streets = pd.concat([final_data_streets, new_streets_df], ignore_index=True)
+        final_map_streets = pd.concat([final_map_streets, new_map_df], ignore_index=True)
+        final_data_points = pd.concat([final_data_points, new_points_df], ignore_index=True)
 
         # Re-indexa
-        final_data_streets, final_data_points, final_map_streets = self._rebuild_and_reindex_gdfs(
-            final_data_streets, final_data_points, final_map_streets
-        )
+        final_data_streets, final_data_points, final_map_streets = self._reindex_dfs(final_data_streets, final_data_points, final_map_streets)
 
-        # Mapa visual
-        print("Editor: Reconstruindo map_points...")
+        # Mapa de Pontos
         old_map_points_state = state.map_points[['node_index', 'eh_requerido', 'depot', 'custo_servico', 'demanda']].set_index('node_index')
+        final_map_points_df = GeoCalculator.create_map_points(final_data_points)
+        final_map_points_df = FieldsManager.ensure_fields_exist(final_map_points_df, FieldConfigType.EXTENDED)
         
-        final_map_points_gdf = GeoCalculator.create_map_points(final_data_points)
-        final_map_points_gdf = FieldsManager.ensure_fields_exist(final_map_points_gdf, FieldConfigType.EXTENDED)
+        final_map_points_df = final_map_points_df.set_index('node_index')
+        final_map_points_df.update(old_map_points_state)
+        final_map_points_df = final_map_points_df.reset_index()
         
-        final_map_points_gdf = final_map_points_gdf.set_index('node_index')
-        final_map_points_gdf.update(old_map_points_state)
-        final_map_points_gdf = final_map_points_gdf.reset_index()
-        final_map_points_gdf.loc[final_map_points_gdf['node_index'] == new_node_id, 'eh_requerido'] = req_val
-        final_map_points_gdf.loc[final_map_points_gdf['node_index'] == new_node_id, 'depot'] = depot_val
-        final_map_points_gdf.loc[final_map_points_gdf['node_index'] == new_node_id, 'custo_servico'] = new_node_cost
-
-        final_map_points_gdf['tooltip_html'] = final_map_points_gdf.apply(lambda row: self._preformat_node_tooltip(row.to_dict()), axis=1)
+        # Garante atributos do novo nó
+        mask_new = final_map_points_df['node_index'] == new_node_id
+        final_map_points_df.loc[mask_new, ['eh_requerido', 'depot', 'custo_servico']] = [req_val, depot_val, new_node_cost]
         
-        final_map_points_gdf = self._sanitize_and_build_gdf(final_map_points_gdf, safe_crs_m)
+        final_map_points_df['tooltip_html'] = final_map_points_df.apply(lambda row: self._preformat_node_tooltip(row.to_dict()), axis=1)
 
         print(f"Editor: Divisão concluída.")
         
         return GraphState(
             data_streets=final_data_streets, data_points=final_data_points,
-            map_streets=final_map_streets, map_points=final_map_points_gdf,
-            neighborhoods=state.neighborhoods 
+            map_streets=final_map_streets, map_points=final_map_points_df,
+            neighborhoods=state.neighborhoods, crs=state.crs
         )
     
     def remove_node_and_merge_streets(self, state: GraphState, node_id_C: int) -> GraphState:
         """
-        Remove um nó temporário (C) e mescla as duas ruas conectadas (A-C e C-B)
-        de volta em uma única rua (A-B).
+        Remove um nó temporário (C) e mescla as duas ruas conectadas (A-C e C-B).
         """
         print(f"Editor: Removendo nó {node_id_C} e mesclando ruas...")
         
@@ -754,74 +659,41 @@ class GraphEditor:
             'angle_inv': 0.0
         })
 
-        # Remove IDs antigos (AC, CB) e pontos C (e A, B antigos)
+        # Atualiza DataFrames
         ids_to_remove = [id_AC, id_CB]
-        
-        # Limpeza
-        data_streets_clean = state.data_streets[~state.data_streets['id'].isin(ids_to_remove)].copy()
-        map_streets_clean = state.map_streets[~state.map_streets['id'].isin(ids_to_remove)].copy()
-        
-        # Remove pontos ligados às ruas removidas
-        data_points_clean = state.data_points[~state.data_points['from_line_id'].isin(ids_to_remove)].copy()
+        final_data_streets = state.data_streets[~state.data_streets['id'].isin(ids_to_remove)].copy()
+        final_map_streets = state.map_streets[~state.map_streets['id'].isin(ids_to_remove)].copy()
+        final_data_points = state.data_points[~state.data_points['from_line_id'].isin(ids_to_remove)].copy()
 
-        safe_crs_s, safe_crs_m, safe_crs_p = data_streets_clean.crs, map_streets_clean.crs, data_points_clean.crs
+        new_streets_df = pd.DataFrame([dict_AB])
+        new_map_df = pd.DataFrame([dict_map_AB])
+        new_points_df = pd.DataFrame([dict_pt_A, dict_pt_B])
 
-        # Cria DataFrames
-        df_new_street = pd.DataFrame([dict_AB])
-        df_new_map = pd.DataFrame([dict_map_AB])
-        df_new_points = pd.DataFrame([dict_pt_A, dict_pt_B])
+        new_streets_df = self._align_dataframe_structure(new_streets_df, final_data_streets)
+        new_map_df = self._align_dataframe_structure(new_map_df, final_map_streets)
+        new_points_df = self._align_dataframe_structure(new_points_df, final_data_points)
 
-        # Alinha estrutura
-        df_new_street = self._align_dataframe_structure(df_new_street, data_streets_clean)
-        df_new_map = self._align_dataframe_structure(df_new_map, map_streets_clean)
-        df_new_points = self._align_dataframe_structure(df_new_points, data_points_clean)
+        final_data_streets = pd.concat([final_data_streets, new_streets_df], ignore_index=True)
+        final_map_streets = pd.concat([final_map_streets, new_map_df], ignore_index=True)
+        final_data_points = pd.concat([final_data_points, new_points_df], ignore_index=True)
 
-        # Cria GDFs temporários
-        gdf_new_street = gpd.GeoDataFrame(df_new_street, geometry='geometry')
-        gdf_new_map = gpd.GeoDataFrame(df_new_map, geometry='geometry')
-        gdf_new_points = gpd.GeoDataFrame(df_new_points, geometry='geometry')
+        final_data_streets, final_data_points, final_map_streets = self._reindex_dfs(final_data_streets, final_data_points, final_map_streets)
 
-        # Lobotomia CRS
-        data_streets_clean.crs = None; gdf_new_street.crs = None
-        map_streets_clean.crs = None; gdf_new_map.crs = None
-        data_points_clean.crs = None; gdf_new_points.crs = None
-
-        # Concat
-        final_data_streets_df = pd.concat([data_streets_clean, gdf_new_street], ignore_index=True)
-        final_map_streets_df = pd.concat([map_streets_clean, gdf_new_map], ignore_index=True)
-        final_data_points_df = pd.concat([data_points_clean, gdf_new_points], ignore_index=True)
-
-        # Restaura
-        final_data_streets = self._sanitize_and_build_gdf(final_data_streets_df, safe_crs_s)
-        final_map_streets = self._sanitize_and_build_gdf(final_map_streets_df, safe_crs_m)
-        final_data_points = self._sanitize_and_build_gdf(final_data_points_df, safe_crs_p)
-
-        # Re-indexa
-        final_data_streets, final_data_points, final_map_streets = self._rebuild_and_reindex_gdfs(
-            final_data_streets, final_data_points, final_map_streets
-        )
-
-        print("Editor: Reconstruindo map_points...")
+        # Mapa de Pontos
         old_map_points_state = state.map_points[['node_index', 'eh_requerido', 'depot', 'custo_servico', 'demanda']].set_index('node_index')
-        
         final_map_points_gdf = GeoCalculator.create_map_points(final_data_points)
         final_map_points_gdf = FieldsManager.ensure_fields_exist(final_map_points_gdf, FieldConfigType.EXTENDED)
-        
         final_map_points_gdf = final_map_points_gdf.set_index('node_index')
         final_map_points_gdf.update(old_map_points_state)
         final_map_points_gdf = final_map_points_gdf.reset_index()
         final_map_points_gdf = final_map_points_gdf[final_map_points_gdf['node_index'] != node_id_C]
-
-        final_map_points_gdf['tooltip_html'] = final_map_points_gdf.apply(lambda row: self._preformat_node_tooltip(row.to_dict()), axis=1)
         
-        final_map_points_gdf = self._sanitize_and_build_gdf(final_map_points_gdf, safe_crs_m)
+        final_map_points_gdf['tooltip_html'] = final_map_points_gdf.apply(lambda row: self._preformat_node_tooltip(row.to_dict()), axis=1)
 
         print("Editor: Remoção e Mesclagem concluída.")
-
+        
         return GraphState(
-            data_streets=final_data_streets,
-            data_points=final_data_points,
-            map_streets=final_map_streets,
-            map_points=final_map_points_gdf,
-            neighborhoods=state.neighborhoods 
+            data_streets=final_data_streets, data_points=final_data_points,
+            map_streets=final_map_streets, map_points=final_map_points_gdf,
+            neighborhoods=state.neighborhoods, crs=state.crs
         )

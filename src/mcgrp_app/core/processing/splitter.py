@@ -1,7 +1,6 @@
 # src\mcgrp_app\core\processing\splitter.py
 
 import pandas as pd
-import geopandas as gpd
 from shapely.geometry import Point, LineString
 
 from ..utils import GeoCalculator, GraphState
@@ -70,40 +69,45 @@ class LineStringSplitter:
             self._process_one_line(street_row, points_in_line, split_indices)
             
         # Finalmente, reconstrói e re-indexa tudo
-        state = self._rebuild_and_reindex_gdfs(state)
+        state = self._rebuild_and_reindex_dfs(state)
 
         return state
 
-    def _find_split_indices(self, points_gdf: gpd.GeoDataFrame, united: bool, depot: bool, required: bool) -> list:
+    def _find_split_indices(self, points_df: pd.DataFrame, united: bool, depot: bool, required: bool) -> list:
         """Encontra os 'vertex_index' onde uma rua deve ser dividida."""
         split_indices = set()
+        total_points = len(points_df)
         
         # Itera sobre os pontos intermediários (não o primeiro nem o último)
-        for point in points_gdf.itertuples(index=False):
+        for point in points_df.itertuples(index=False):
             v_index = point.vertex_index
-            if v_index == 0 or v_index == (len(points_gdf) - 1):
+            if v_index == 0 or v_index == (total_points - 1):
                 continue
+
+            is_united = getattr(point, 'eh_unido', 'no') == 'yes'
+            is_depot = getattr(point, 'depot', 'no') == 'yes'
+            is_required = getattr(point, 'eh_requerido', 'no') == 'yes'
                 
-            if united and point.eh_unido == 'yes':
+            if united and is_united:
                 split_indices.add(v_index)
-            elif depot and point.depot == 'yes':
+            elif depot and is_depot:
                 split_indices.add(v_index)
-            elif required and point.eh_requerido == 'yes':
+            elif required and is_required:
                 split_indices.add(v_index)
                 
         return sorted(list(split_indices))
         
-    def _process_one_line(self, street_row: pd.Series, points_gdf: gpd.GeoDataFrame, split_indices: list):
+    def _process_one_line(self, street_row: any, points_df: pd.DataFrame, split_indices: list):
         """Processa uma rua, dividindo-a nos 'split_indices'."""
         
         # Se não há divisões, apenas adiciona os dados originais
         if not split_indices:
             self.new_data_streets_list.append(street_row._asdict())
-            self.new_data_points_list.extend(points_gdf.to_dict('records'))
+            self.new_data_points_list.extend(points_df.to_dict('records'))
             return
 
         # Converte para dicts
-        points_list = points_gdf.to_dict('records')
+        points_list = points_df.to_dict('records')
         
         # Adiciona o início (0) e o fim (N-1) para criar os segmentos
         segment_indices = [0] + split_indices + [len(points_list) - 1]
@@ -122,7 +126,7 @@ class LineStringSplitter:
             
             self._create_new_segment(street_row, segment_points_dicts, new_temp_id)
     
-    def _create_new_segment(self, original_street: pd.Series, segment_points_dicts: list, new_line_id: int):
+    def _create_new_segment(self, original_street: any, segment_points_dicts: list, new_line_id: int):
         """
         Cria uma nova rua e seus novos pontos a partir de um segmento.
         Recalcula todos os atributos.
@@ -140,7 +144,7 @@ class LineStringSplitter:
         new_segment_points = []
         
         for i, point_dict in enumerate(segment_points_dicts):
-            new_point_props = point_dict.copy()     # Copia atributos (ex: eh_unido)
+            new_point_props = point_dict.copy()
             
             # Define/Sobrescreve atributos do novo segmento
             new_point_props['from_line_id'] = new_line_id
@@ -169,7 +173,7 @@ class LineStringSplitter:
                 new_point_props['angle_inv'] = round(GeoCalculator.azimuth_inverse(angle), GeoCalculator.PRECISION_DIGITS)
                 
                 # Se for 'unido', mantém. Se não, é 'intermediário'
-                if i > 0 and new_point_props['eh_unido'] != 'yes':
+                if i > 0 and new_point_props.get('eh_unido') != 'yes':
                     new_point_props['eh_extremidade'] = 'no'
             else:
                 new_point_props['angle'] = None
@@ -185,51 +189,43 @@ class LineStringSplitter:
         self.new_data_streets_list.append(new_street_props)
         self.new_data_points_list.extend(new_segment_points)
     
-    def _rebuild_and_reindex_gdfs(self, state: GraphState) -> GraphState:
+    def _rebuild_and_reindex_dfs(self, state: GraphState) -> GraphState:
         """
-        Reconstrói e re-indexa os GFDs e retorna o novo estado.
+        Reconstrói e re-indexa os DataFrames e retorna o novo estado.
         """
         print(f"  Divisão concluída. {len(self.new_data_streets_list)} novos segmentos criados.")
-        print("  Reconstruindo e re-indexando GDFs...")
+        print("  Reconstruindo e re-indexando DataFrames...")
         
         if not self.new_data_streets_list:
             return state        # Nada foi alterado
 
-        # Cria GDF de ruas (com IDs temporários)
-        temp_streets_gdf = gpd.GeoDataFrame(
-            self.new_data_streets_list, 
-            crs=state.data_streets.crs
-        )
+        # Cria DataFrame de ruas
+        temp_streets_df = pd.DataFrame(self.new_data_streets_list)
         
         # Cria mapa de re-indexação (ID_temporário -> ID_final_1_N)
         # Reseta o índice (0 a N-1) e adiciona 1 (1 a N)
-        temp_streets_gdf = temp_streets_gdf.reset_index(drop=True)
-        temp_streets_gdf['final_id'] = temp_streets_gdf.index + 1
+        temp_streets_df = temp_streets_df.reset_index(drop=True)
+        temp_streets_df['final_id'] = temp_streets_df.index + 1
         
         # Cria o mapa: {temp_id: final_id}
-        id_map = temp_streets_gdf.set_index('id')['final_id'].to_dict()
+        id_map = dict(zip(temp_streets_df['id'], temp_streets_df['final_id']))
         
         # Aplica o ID final
-        temp_streets_gdf['id'] = temp_streets_gdf['final_id']
-        state.data_streets = temp_streets_gdf.drop(columns='final_id')
+        temp_streets_df['id'] = temp_streets_df['final_id']
+        state.data_streets = temp_streets_df.drop(columns='final_id')
         
-        # Cria GDF de pontos (com IDs temporários)
-        temp_points_gdf = gpd.GeoDataFrame(
-            self.new_data_points_list, 
-            crs=state.data_points.crs
-        )
+        # Cria DataFrame de pontos
+        temp_points_df = pd.DataFrame(self.new_data_points_list)
         
         # Propaga os IDs finais para os pontos
-        temp_points_gdf['from_line_id'] = temp_points_gdf['from_line_id'].map(id_map)
-        state.data_points = temp_points_gdf
+        temp_points_df['from_line_id'] = temp_points_df['from_line_id'].map(id_map)
+        state.data_points = temp_points_df
 
-        # Constrói o GDF de mapa (se aplicável)
+        # Constrói o DF de mapa (se aplicável)
         if self.new_map_streets_list:
-            temp_map_streets_gdf = gpd.GeoDataFrame(
-                self.new_map_streets_list, crs=state.map_streets.crs
-            )
-            temp_map_streets_gdf['id'] = temp_map_streets_gdf['id'].map(id_map)
-            state.map_streets = temp_map_streets_gdf
+            temp_map_streets_df = pd.DataFrame(self.new_map_streets_list)
+            temp_map_streets_df['id'] = temp_map_streets_df['id'].map(id_map)
+            state.map_streets = temp_map_streets_df
         else:
             # Se não, espelha as ruas de dados
             state.map_streets = state.data_streets.copy()
@@ -250,33 +246,37 @@ class LineStringSplitter:
         # Agrupa os pontos lógicos
         points_by_line = state.data_points.groupby('from_line_id')
         
-        # Mapeia ID da rua para a linha do GDF de mapa
-        map_streets_map = {row.id: row for row in state.map_streets.itertuples()}
+        # Mapeia ID da rua para a linha do DF de mapa
+        map_streets_records = state.map_streets.to_dict('records')
+        map_streets_map = {row['id']: row for row in map_streets_records}
 
         # Itera sobre cada RUA DE DADOS
         for street_row in state.data_streets.itertuples():
             line_id = street_row.id
             
             try:
-                data_points_gdf = points_by_line.get_group(line_id).sort_values('vertex_index')
+                data_points_df = points_by_line.get_group(line_id).sort_values('vertex_index')
             except KeyError:
                 continue        # Rua sem pontos
 
             # Obtém a rua visual correspondente
-            map_street_row = map_streets_map.get(line_id)
+            map_street_dict = map_streets_map.get(line_id)
 
             # CASO 1: Rua já tem 2 pontos
-            if len(data_points_gdf) <= 2:
+            if len(data_points_df) <= 2:
                 self.new_data_streets_list.append(street_row._asdict())
-                self.new_data_points_list.extend(data_points_gdf.to_dict('records'))
-                if map_street_row:
-                    self.new_map_streets_list.append(map_street_row._asdict())
+                self.new_data_points_list.extend(data_points_df.to_dict('records'))
+                if map_street_dict:
+                    self.new_map_streets_list.append(map_street_dict)
                 continue
 
             # CASO 2: Rua tem > 2 pontos 
             # Converte para dicts para fatiamento
-            points_list = data_points_gdf.to_dict('records')
-            map_coords = list(map_street_row.geometry.coords) if map_street_row else None
+            points_list = data_points_df.to_dict('records')
+
+            map_coords = None
+            if map_street_dict and 'geometry' in map_street_dict:
+                map_coords = list(map_street_dict['geometry'].coords)
             
             # Itera sobre os novos segmentos
             for i in range(len(points_list) - 1):
@@ -293,27 +293,34 @@ class LineStringSplitter:
                     Point(pt1_dict['geometry']).coords[0],
                     Point(pt2_dict['geometry']).coords[0]
                 ])
-                new_data_street['total_dist'] = pt2_dict['distance'] 
+                new_data_street['total_dist'] = pt2_dict.get('distance', 0)
                 self.new_data_streets_list.append(new_data_street)
 
                 # Cria nova rua (mapa)
-                if map_street_row:
-                    new_map_street = map_street_row._asdict()
+                if map_street_dict:
+                    new_map_street = map_street_dict.copy()
                     new_map_street['id'] = new_temp_id
-                    new_map_street['total_dist'] = pt2_dict['distance']
-                    
-                    # Encontra as coordenadas visuais para este segmento
-                    try:
-                        start_idx = pt1_dict['vertex_index']
-                        end_idx = pt2_dict['vertex_index']
-                        new_map_street['geometry'] = LineString(map_coords[start_idx : end_idx + 1])
-                    except Exception:
-                        # Fallback: usa a geometria dos dados (sem curvas)
+                    new_map_street['total_dist'] = pt2_dict.get('distance')
+
+                    if map_coords:
+                        # Encontra as coordenadas visuais para este segmento
+                        try:
+                            start_idx = pt1_dict['vertex_index']
+                            end_idx = pt2_dict['vertex_index']
+                            segment_coords = map_coords[start_idx : end_idx + 1]
+                            if len(segment_coords) >= 2:
+                                new_map_street['geometry'] = LineString(segment_coords)
+                            else:
+                                raise ValueError("Segmento visual curto")
+                        except Exception:
+                            # Fallback: usa a geometria dos dados
+                            new_map_street['geometry'] = new_data_street['geometry']
+                    else:
                         new_map_street['geometry'] = new_data_street['geometry']
-                        
+                            
                     self.new_map_streets_list.append(new_map_street)
                 
-                # Cria novos pontos
+                # Cria novos pontos para o segmento
                 new_pt1 = pt1_dict.copy()       # cópia o ponto1
                 new_pt1.update({
                     'from_line_id': new_temp_id, 
@@ -336,5 +343,4 @@ class LineStringSplitter:
                 self.new_data_points_list.append(new_pt1)
                 self.new_data_points_list.append(new_pt2)
 
-        # Reconstrói e Re-indexa GDFs
-        return self._rebuild_and_reindex_gdfs(state)
+        return self._rebuild_and_reindex_dfs(state)

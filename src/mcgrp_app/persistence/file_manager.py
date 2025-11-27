@@ -4,12 +4,12 @@ import os
 import pandas as pd
 import geopandas as gpd
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Union
 from shapely.geometry import LineString
 
 from PySide6.QtCore import QObject, Signal
 
-from ..core.utils import FieldsManager, GeoCalculator
+from ..core.utils import FieldsManager, GeoFactory
 
 class FileManager(QObject):
     """
@@ -24,8 +24,6 @@ class FileManager(QObject):
     neighborhoods_loaded = Signal(gpd.GeoDataFrame, str)
     error_occurred = Signal(str)
 
-    TARGET_CRS = "EPSG:4326"
-
     def __init__(self, parent=None):
         super().__init__(parent)
         self.streets_gdf = None
@@ -34,26 +32,24 @@ class FileManager(QObject):
     def _check_and_convert_crs(self, gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
         """
         Garante que o GeoDataFrame esteja no CRS EPSG:4326.
-        Tenta converter se for diferente, falha se não for possível.
-        
-        Retorna: O GeoDataFrame com o CRS correto.
-        Levanta: ValueError se o CRS estiver ausente ou a conversão falhar.
         """
+        target_crs = GeoFactory.DEFAULT_CRS
+
         if gdf.crs is None:
             raise ValueError("O arquivo não possui CRS (Sistema de Coordenadas) definido. Impossível validar.")
         
         # Compara usando a representação string
-        if gdf.crs.to_string() == self.TARGET_CRS:
-            print("CRS está correto (EPSG:4326).")
+        if gdf.crs.to_string() == target_crs:
+            print(f"CRS está correto ({target_crs}).")
             return gdf
         
-        print(f"CRS detectado: {gdf.crs.to_string()}. Tentando converter para {self.TARGET_CRS}...")
+        print(f"CRS detectado: {gdf.crs.to_string()}. Tentando converter para {target_crs}...")
         try:
-            gdf_converted = gdf.to_crs(self.TARGET_CRS)
+            gdf_converted = gdf.to_crs(target_crs)
             print("Conversão de CRS realizada com sucesso.")
             return gdf_converted
         except Exception as e:
-            raise ValueError(f"Falha ao converter CRS de '{gdf.crs.to_string()}' para '{self.TARGET_CRS}'.\nErro: {e}")
+            raise ValueError(f"Falha ao converter CRS de '{gdf.crs.to_string()}' para '{target_crs}'.\nErro: {e}")
 
     def load_geopackage_streets(self, file_path: str):
         """
@@ -145,10 +141,10 @@ class FileManager(QObject):
                 self.error_occurred.emit(f"Erro ao deletar arquivo: {e}")
     
     @staticmethod
-    def export_to_geopackage(datasets: Dict[str, Optional[gpd.GeoDataFrame]], output_file: str, field_config: Optional[Dict] = None) -> None:
+    def export_to_geopackage(datasets: Dict[str, Union[pd.DataFrame, gpd.GeoDataFrame]], output_file: str, field_config: Optional[Dict] = None) -> None:
         """
-        Salva um dicionário de GeoDataFrames em um único arquivo GeoPackage,
-        onde cada GDF (chave do dicionário) é uma camada separada.
+        Salva um dicionário de DataFrames (Pandas ou GeoPandas) em um único arquivo GeoPackage.
+        Usa GeoFactory para converter Pandas DataFrames em GeoDataFrames antes de salvar.
         """
         output_filename = f"{output_file}.gpkg"
         print(f"Exportando para: {output_filename}")
@@ -163,25 +159,15 @@ class FileManager(QObject):
             elif py_type == str:
                 pandas_dtypes[col] = 'string'
                 
-        for layer_name, gdf in datasets.items():
-            if gdf is None or gdf.empty:
+        for layer_name, data in datasets.items():
+            if data is None or data.empty:
                 print(f"  Aviso: Camada '{layer_name}' está vazia ou nula. Pulando...")
                 continue
             
-            # Extraímos os dados brutos para criar um novo 
-            # objeto na thread atual, desvinculado do CRS antigo.
             try:
-                # Extrai dados como DataFrame Pandas (remove metadados Geo)
-                df_raw = pd.DataFrame(gdf.drop(columns='geometry'))
-                
-                # Extrai geometria como lista/array de objetos Shapely
-                geometry_raw = gdf.geometry.values
-                
-                # Constrói NOVO GeoDataFrame
-                subset = gpd.GeoDataFrame(df_raw, geometry=geometry_raw, crs=GeoCalculator.BASE_CRS)
-                
+                subset = GeoFactory.to_gdf(data, GeoFactory.DEFAULT_CRS)
             except Exception as e:
-                print(f"  Erro ao reconstruir GDF para exportação: {e}")
+                print(f"  Erro ao converter camada '{layer_name}' para GeoDataFrame: {e}")
                 continue
             
             # Força a tipagem
@@ -194,16 +180,16 @@ class FileManager(QObject):
                 except Exception as e:
                     print(f"  Aviso: Falha ao forçar tipagem na camada '{layer_name}'. {e}")
 
-            # Aplica field_config
+            # Filtra colunas baseado na configuração (se fornecida)
             if field_config:
-                geom_type = ""
+                geom_type_key = ""
                 if "line" in layer_name.lower() or "street" in layer_name.lower():
-                    geom_type = "LineString"
+                    geom_type_key = "LineString"
                 elif "point" in layer_name.lower() or "node" in layer_name.lower():
-                    geom_type = "Point"
+                    geom_type_key = "Point"
                 
-                if geom_type in field_config:
-                    fields = field_config[geom_type].copy()
+                if geom_type_key in field_config:
+                    fields = field_config[geom_type_key].copy()
                     if "geometry" not in fields:
                         fields.append("geometry")       # Garantir geometria
                     
@@ -215,20 +201,20 @@ class FileManager(QObject):
             try:
                 initial_count = len(subset)
                 
-                # Remove Nulos/Vazios
+                # Remove geometrias nulas/vazias
                 subset = subset[subset.geometry.notna()]
                 subset = subset[~subset.geometry.is_empty]
                 
-                # Make Valid
+                # Tenta corrigir geometrias inválidas
                 subset['geometry'] = subset.geometry.make_valid()
                 
-                # Filtra Tipos Específicos
+                # Filtra tipos específicos e validade lógica para ruas
                 if "line" in layer_name.lower() or "street" in layer_name.lower():
                     subset = subset[subset.geometry.apply(
                         lambda geom: isinstance(geom, LineString) and len(geom.coords) >= 2 and geom.length > 0
                     )]
                 
-                # is_valid final
+                # Checagem final de validade
                 subset = subset[subset.geometry.is_valid]
 
                 if len(subset) < initial_count:

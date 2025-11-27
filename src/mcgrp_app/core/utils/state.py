@@ -1,22 +1,24 @@
 # src\mcgrp_app\core\utils\state.py
 
-import geopandas as gpd
+import pandas as pd
 from dataclasses import dataclass
 from typing import Optional
 
 @dataclass
 class GraphState:
     """
-    Encapsula todos os GeoDataFrames que definem o estado 
-    atual do pipeline de processamento do grafo.
+    Encapsula o estado atual do grafo.
     """
-    # GDFs de Lógica (para processamento)
-    data_streets: gpd.GeoDataFrame
-    data_points: Optional[gpd.GeoDataFrame]
+    # DataFrames de Lógica (para processamento)
+    data_streets: pd.DataFrame
+    data_points: Optional[pd.DataFrame]
     
-    # GDFs de Mapa (para visualização)
-    map_streets: gpd.GeoDataFrame
-    map_points: Optional[gpd.GeoDataFrame]
+    # DataFrames de Mapa (para visualização)
+    map_streets: pd.DataFrame
+    map_points: Optional[pd.DataFrame]
     
-    # GDFs de Referência
-    neighborhoods: gpd.GeoDataFrame
+    # DataFrames de Referência
+    neighborhoods: pd.DataFrame
+    
+    # CRS padrão
+    crs: str = "EPSG:4326"

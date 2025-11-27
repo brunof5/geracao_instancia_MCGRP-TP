@@ -5,7 +5,10 @@ import os
 import tempfile
 import traceback
 import folium
+import pandas as pd
+import geopandas as gpd
 from pathlib import Path
+from typing import Optional, Union
 from folium.utilities import JsCode
 from shapely.geometry.base import BaseGeometry
 
@@ -14,11 +17,17 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEngineSettings, QWebEnginePage
 from PySide6.QtCore import QUrl, QFileInfo, Slot
 
+from ...core.utils import GeoFactory
+
 class MapWidget(QWidget):
     """
     Widget de mapa com a ponte QWebChannel integrada.
-    Ele expõe uma 'page' para a MainWindow e pode
-    receber comandos de JS.
+    Responsável EXCLUSIVAMENTE pela visualização.
+    
+    Arquitetura:
+    - Recebe GeoDataFrames (ou converte DataFrames usando GeoFactory).
+    - Renderiza HTML/JS via Folium.
+    - Comunica cliques via JS Bridge.
     """
     LAVRAS_COORDINATES = [-21.2465, -45.0000]
     
@@ -47,9 +56,9 @@ class MapWidget(QWidget):
         self.layout.addWidget(self.web_view)
 
         # Armazena os dados
-        self.streets_gdf = None
-        self.neighborhoods_gdf = None
-        self.points_gdf = None
+        self.streets_gdf: Optional[gpd.GeoDataFrame] = None
+        self.neighborhoods_gdf: Optional[gpd.GeoDataFrame] = None
+        self.points_gdf: Optional[gpd.GeoDataFrame] = None
 
         # Estado de visibilidade
         self.show_nodes = False
@@ -121,7 +130,7 @@ class MapWidget(QWidget):
         m.add_child(folium.Element("<script>window.leafletLayers = {};</script>"))
 
         # Adiciona Camada de Bairros (se existir)
-        if self.neighborhoods_gdf is not None:
+        if self.neighborhoods_gdf is not None and not self.neighborhoods_gdf.empty:
             # Cria um "Grupo de Features" para esta camada
             neigh_layer = folium.FeatureGroup(name="Bairros")
 
@@ -146,7 +155,7 @@ class MapWidget(QWidget):
             neigh_layer.add_to(m)
         
         # Adiciona Camada de Ruas (se existir)
-        if self.streets_gdf is not None:
+        if self.streets_gdf is not None and not self.streets_gdf.empty:
             street_layer = folium.FeatureGroup(name="Ruas")
 
             on_each_street = JsCode("""
@@ -177,7 +186,7 @@ class MapWidget(QWidget):
             street_layer.add_to(m)
 
         # Adiciona Camada de Nós (se existir)
-        if self.points_gdf is not None:
+        if self.points_gdf is not None and not self.points_gdf.empty:
             points_layer = folium.FeatureGroup(name="Nós")
 
             on_each_node = JsCode("""
@@ -279,22 +288,42 @@ class MapWidget(QWidget):
             print(f"Erro ao salvar/carregar mapa temporário: {e}")
             traceback.print_exc()
     
+    def _ensure_gdf(self, data: Union[pd.DataFrame, gpd.GeoDataFrame, None]) -> Optional[gpd.GeoDataFrame]:
+        """
+        Helper defensivo: Se receber um Pandas DataFrame, converte para GeoDataFrame.
+        Se receber GeoDataFrame, retorna como está.
+        """
+        if data is None:
+            return None
+        
+        if isinstance(data, gpd.GeoDataFrame):
+            return data
+        
+        if isinstance(data, pd.DataFrame):
+            print("MapWidget: Convertendo DataFrame puro para GeoDataFrame para renderização.")
+            try:
+                return GeoFactory.to_gdf(data, GeoFactory.DEFAULT_CRS)
+            except Exception as e:
+                print(f"MapWidget Erro: Falha ao converter DF para GDF: {e}")
+                return None
+        
+        return None
+    
     def update_layers(self, streets_gdf=None, neighborhoods_gdf=None, points_gdf=None):
         """
-        Recebe novos GeoDataFrames e redesenha o mapa.
-        Se um GDF não for fornecido, usa o que já está armazenado.
+        Recebe novos dados e redesenha o mapa.
         """
         if neighborhoods_gdf is not None:
-            print("MapWidget: Recebendo GDF de bairros...")
-            self.neighborhoods_gdf = neighborhoods_gdf
+            print("MapWidget: Recebendo camada de bairros...")
+            self.neighborhoods_gdf = self._ensure_gdf(neighborhoods_gdf)
         
         if streets_gdf is not None:
-            print("MapWidget: Recebendo GDF de ruas...")
-            self.streets_gdf = streets_gdf
+            print("MapWidget: Recebendo camada de ruas...")
+            self.streets_gdf = self._ensure_gdf(streets_gdf)
 
         if points_gdf is not None:
-            print("MapWidget: Recebendo GDF de nós...")
-            self.points_gdf = points_gdf
+            print("MapWidget: Recebendo camada de nós...")
+            self.points_gdf = self._ensure_gdf(points_gdf)
         
         # Renderiza o mapa com as novas camadas
         self._render_map()
@@ -401,11 +430,15 @@ class MapWidget(QWidget):
         try:
             # Obtém o caminho para o arquivo JS no mesmo diretório do map_widget.py
             js_path = Path(__file__).parent / "map_utility.js"
-            with open(js_path, "r", encoding="utf-8") as f:
-                js_code = f.read()
-            
-            # Retorna o script envolvido nas tags <script>
-            return f"<script>{js_code}</script>"
+            if js_path.exists():
+                with open(js_path, "r", encoding="utf-8") as f:
+                    js_code = f.read()
+                
+                # Retorna o script envolvido nas tags <script>
+                return f"<script>{js_code}</script>"
+            else:
+                print(f"Aviso: map_utility.js não encontrado em {js_path}")
+                return "<script>console.warn('map_utility.js not found');</script>"
             
         except Exception as e:
             print(f"Erro CRÍTICO: Não foi possível carregar map_utility.js: {e}")

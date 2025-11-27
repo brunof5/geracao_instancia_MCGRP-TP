@@ -1,11 +1,8 @@
 # src\mcgrp_app\core\utils\fields.py
 
+import pandas as pd
 from enum import Enum
-from typing import TYPE_CHECKING
-
-# Para evitar importação circular
-if TYPE_CHECKING:
-    from geopandas import GeoDataFrame
+from typing import Set
 
 class FieldConfigType(Enum):
     """
@@ -164,20 +161,34 @@ class FieldsManager:
             }
     
     @classmethod
-    def ensure_fields_exist(cls, gdf: "GeoDataFrame", config_type: FieldConfigType) -> "GeoDataFrame":
+    def ensure_fields_exist(cls, df: pd.DataFrame, config_type: FieldConfigType) -> pd.DataFrame:
         """
-        Garante que o GeoDataFrame possua todos os campos esperados
+        Garante que o DataFrame (Pandas ou GeoPandas) possua todos os campos esperados
         (básicos ou estendidos), criando colunas ausentes com valor None.
         """
 
-        if gdf is None or len(gdf) == 0:
-            return gdf
+        if df is None or len(df) == 0:
+            return df
 
         # Define os conjuntos de campos esperados conforme configuração
         field_config = cls.get_field_config(config_type)
 
         # Determina quais geometrias existem no GDF
-        geom_types_present = set(gdf.geometry.geom_type.unique())
+        geom_types_present: Set[str] = set()
+
+        if hasattr(df, 'geom_type'):
+            # GeoDataFrame
+            geom_types_present = set(df.geom_type.unique())
+        elif 'geometry' in df.columns:
+            # DataFrame Pandas
+            # Filtra nulos antes de verificar o tipo
+            valid_geoms = df['geometry'].dropna()
+            if not valid_geoms.empty:
+                geom_types_present = set(valid_geoms.apply(lambda x: x.geom_type if hasattr(x, 'geom_type') else None).unique())
+                geom_types_present.discard(None)
+        else:
+            # Sem geometria
+            return df
 
         supported_types = {"Point", "LineString"}
         invalid_types = geom_types_present - supported_types
@@ -191,9 +202,9 @@ class FieldsManager:
             expected_fields.update(field_config[gt])
 
         # Adiciona campos faltantes com valores padrão
-        for field in expected_fields:
-            if field not in gdf.columns:
+        for field in list(expected_fields):
+            if field not in df.columns:
                 default_value = cls._FIELD_DEFAULTS.get(field, None)
-                gdf[field] = default_value
+                df[field] = default_value
 
-        return gdf
+        return df

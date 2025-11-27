@@ -22,7 +22,7 @@ from .load_from_db_dialog import LoadFromDBDialog
 from .widgets.map_widget import MapWidget
 from ..persistence import FileManager
 from .worker import PipelineWorker
-from ..core.utils import GraphState
+from ..core.utils import GraphState, GeoFactory
 
 # --- CLASSE DA PONTE (JS <-> Python) ---
 class Bridge(QObject):
@@ -63,7 +63,7 @@ class MainWindow(QMainWindow):
     Janela principal da aplicação MCGRP.
     """
     # Sinal para iniciar o processamento no worker
-    start_processing_signal = Signal(gpd.GeoDataFrame, gpd.GeoDataFrame, str)
+    start_processing_signal = Signal(pd.DataFrame, pd.DataFrame, str)
     # Sinal para atualizar o estado interno do grafo
     load_state_signal = Signal(GraphState)
 
@@ -100,8 +100,8 @@ class MainWindow(QMainWindow):
         self.progress_dialog: Optional[QProgressDialog] = None
 
         # Armazenar os dados processados (cópias locais para a GUI)
-        self.processed_streets_gdf: Optional[gpd.GeoDataFrame] = None
-        self.processed_points_gdf: Optional[gpd.GeoDataFrame] = None
+        self.processed_streets_df: Optional[pd.DataFrame] = None
+        self.processed_points_df: Optional[pd.DataFrame] = None
 
         # Referências da GUI
         self.selection_group_box: Optional[QGroupBox] = None
@@ -222,23 +222,23 @@ class MainWindow(QMainWindow):
         self.file_manager.neighborhoods_loaded.connect(self._on_neighborhoods_loaded)
         self.file_manager.error_occurred.connect(self._on_load_error)
 
-        # Conecta o sinal da MainWindow (GUI Thread) ao slot do Worker (Work Thread)
+        # Conecta o sinal da MainWindow ao slot do Worker
         self.start_processing_signal.connect(self.pipeline_worker.run_pipeline_processing)
         self.load_state_signal.connect(self.pipeline_worker.set_pipeline_state)
 
-        # Conecta o sinal do estado do grafo ao slot do Worker (Work Thread)
+        # Conecta o sinal do estado do grafo ao slot do Worker
         self.toggle_street_request.connect(self.pipeline_worker.on_toggle_street)
         self.toggle_node_request.connect(self.pipeline_worker.on_toggle_node)
         self.set_depot_request.connect(self.pipeline_worker.on_set_depot)
         self.box_select_streets_request.connect(self.pipeline_worker.on_box_select_streets)
         self.add_node_request.connect(self.pipeline_worker.on_add_node_at_street)
         
-        # Conecta os sinais do Worker (Work Thread) aos slots da MainWindow (GUI Thread)
+        # Conecta os sinais do Worker aos slots da MainWindow
         self.pipeline_worker.progress_update.connect(self._on_progress_update)
         self.pipeline_worker.processing_complete.connect(self._on_processing_complete)
         self.pipeline_worker.processing_error.connect(self._on_load_error)
 
-        # Slots para Toggles (rápidos, sem re-render)
+        # Slots para Toggles
         self.pipeline_worker.street_toggled.connect(self._on_street_toggled)
         self.pipeline_worker.node_toggled.connect(self._on_node_toggled)
         self.pipeline_worker.depot_changed.connect(self._on_depot_changed)
@@ -435,29 +435,46 @@ class MainWindow(QMainWindow):
         return None
     
     def _load_state_from_run_id(self, run_id: int):
-        """Helper para carregar os GDFs e enviar ao worker."""
+        """Helper para carregar os GDFs, converter para DF e enviar ao worker."""
         try:
             paths = self.pipeline_worker.pipeline.db_manager.get_run_paths(run_id)
             
-            neigh = self.file_manager.load_gpkg_layer(paths['neighborhoods'], "neighborhoods")
-            ms = self.file_manager.load_gpkg_layer(paths['map'], "streets")
-            mp = self.file_manager.load_gpkg_layer(paths['map'], "points")
-            ds = self.file_manager.load_gpkg_layer(paths['data'], "streets")
-            dp = self.file_manager.load_gpkg_layer(paths['data'], "points")
+            neigh_gdf = self.file_manager.load_gpkg_layer(paths['neighborhoods'], "neighborhoods")
+            ms_gdf = self.file_manager.load_gpkg_layer(paths['map'], "streets")
+            mp_gdf = self.file_manager.load_gpkg_layer(paths['map'], "points")
+            ds_gdf = self.file_manager.load_gpkg_layer(paths['data'], "streets")
+            dp_gdf = self.file_manager.load_gpkg_layer(paths['data'], "points")
             
-            if any(x is None for x in [neigh, ms, mp, ds, dp]): 
+            if any(x is None for x in [neigh_gdf, ms_gdf, mp_gdf, ds_gdf, dp_gdf]):
                 raise ValueError("Falha ao ler camadas do arquivo.")
             
-            self.file_manager.neighborhoods_gdf = neigh
+            self.file_manager.neighborhoods_gdf = neigh_gdf
+
+            # Conversão para DataFrames
+            state_crs = ms_gdf.crs if ms_gdf.crs else GeoFactory.DEFAULT_CRS
+
+            ds_df = GeoFactory.from_gdf(ds_gdf)
+            dp_df = GeoFactory.from_gdf(dp_gdf)
+            ms_df = GeoFactory.from_gdf(ms_gdf)
+            mp_df = GeoFactory.from_gdf(mp_gdf)
+            neigh_df = GeoFactory.from_gdf(neigh_gdf)
             
             # Envia para o worker inicializar o estado
-            new_state = GraphState(data_streets=ds, data_points=dp, map_streets=ms, map_points=mp, neighborhoods=neigh)
+            new_state = GraphState(
+                data_streets=ds_df, 
+                data_points=dp_df, 
+                map_streets=ms_df, 
+                map_points=mp_df, 
+                neighborhoods=neigh_df,
+                crs=state_crs
+            )
             
             self._set_interaction_enabled(False)
             self.load_state_signal.emit(new_state)
             
         except Exception as e:
             self._on_load_error(f"Falha ao carregar registro: {e}")
+            traceback.print_exc()
     
     # --- SLOTS (Métodos que respondem a eventos) ---
 
@@ -535,53 +552,14 @@ class MainWindow(QMainWindow):
             
             print(f"Carregando registro ID: {run_id} do banco de dados...")
             self.statusBar().showMessage(f"Carregando registro ID: {run_id}...")
-            
-            try:
-                # Busca os caminhos no DB
-                paths = self.pipeline_worker.pipeline.db_manager.get_run_paths(run_id)
-                
-                # Carrega os GDFs (usando o FileManager)
-                neigh_gdf = self.file_manager.load_gpkg_layer(
-                    paths['neighborhoods'], "neighborhoods"
-                )
-                map_streets_gdf = self.file_manager.load_gpkg_layer(
-                    paths['map'], "streets"
-                )
-                map_points_gdf = self.file_manager.load_gpkg_layer(
-                    paths['map'], "points"
-                )
-                data_streets_gdf = self.file_manager.load_gpkg_layer(
-                    paths['data'], "streets"
-                )
-                data_points_gdf = self.file_manager.load_gpkg_layer(
-                    paths['data'], "points"
-                )
 
-                # Verifica se tudo foi carregado
-                if any(gdf is None for gdf in [neigh_gdf, map_streets_gdf, map_points_gdf, data_streets_gdf, data_points_gdf]):
-                    raise ValueError("Falha ao carregar uma ou mais camadas do GeoPackage.")
+            self._load_state_from_run_id(run_id)
 
-                # Atualiza o estado da GUI (cópias locais)
-                self.file_manager.neighborhoods_gdf = neigh_gdf
+            self.current_loaded_run_id = -1
+            self.statusBar().showMessage(f"Mapa base {run_id} carregado com sucesso.", 5000)
 
-                # Cria e envia o novo estado do grafo para o pipeline
-                new_state = GraphState(
-                    data_streets=data_streets_gdf,
-                    data_points=data_points_gdf,
-                    map_streets=map_streets_gdf,
-                    map_points=map_points_gdf,
-                    neighborhoods=neigh_gdf
-                )
-                self.load_state_signal.emit(new_state)
-
-                self.current_loaded_run_id = -1
-                self.statusBar().showMessage(f"Mapa base {run_id} carregado com sucesso.", 5000)
-
-                if self.details_dock: self.details_dock.setVisible(True)
-                if self.mode_dock: self.mode_dock.setVisible(True)
-                
-            except Exception as e:
-                self._on_load_error(f"Falha ao carregar registro: {e}")
+            if self.details_dock: self.details_dock.setVisible(True)
+            if self.mode_dock: self.mode_dock.setVisible(True)
     
     @Slot()
     def _on_load_instance_triggered(self):
@@ -640,15 +618,19 @@ class MainWindow(QMainWindow):
         self.load_shp_action.setEnabled(False)
         self.statusBar().showMessage("Processando pipeline... Por favor, aguarde.")
 
-        # Obtém os bairros já carregados
-        neighborhoods_data = self.file_manager.neighborhoods_gdf
+        # Obtém os bairros
+        neighborhoods_gdf = self.file_manager.neighborhoods_gdf
+        neighborhoods_df = GeoFactory.from_gdf(neighborhoods_gdf)
+
+        # Obtém as ruas
+        streets_df = GeoFactory.from_gdf(gdf)
 
         run_name = Path(file_name).stem
 
         self._set_interaction_enabled(False)
         
         print("MainWindow: Emitindo sinal 'start_processing_signal' para a thread do worker.")
-        self.start_processing_signal.emit(gdf, neighborhoods_data, run_name)
+        self.start_processing_signal.emit(streets_df, neighborhoods_df, run_name)
 
     @Slot(gpd.GeoDataFrame, str)
     def _on_neighborhoods_loaded(self, gdf, file_name):
@@ -686,8 +668,8 @@ class MainWindow(QMainWindow):
             self.progress_dialog.setValue(step_num)
             self.progress_dialog.setLabelText(f"{description} ({step_num}/{total_steps})")
     
-    @Slot(gpd.GeoDataFrame, gpd.GeoDataFrame, str, dict)
-    def _on_processing_complete(self, lines_gdf, points_gdf, message, stats_dict):
+    @Slot(pd.DataFrame, pd.DataFrame, str, dict)
+    def _on_processing_complete(self, lines_df, points_df, message, stats_dict):
         """Chamado ao concluir, fecha progresso e mostra os docks."""
         if self.progress_dialog:
             self.progress_dialog.setValue(self.progress_dialog.maximum())
@@ -703,13 +685,13 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Processamento Concluído", final_message)
         
         # Armazena as cópias locais para a GUI
-        self.processed_streets_gdf = lines_gdf
-        self.processed_points_gdf = points_gdf
+        self.processed_streets_df = lines_df
+        self.processed_points_df = points_df
 
         self.current_depot_info = None
 
-        # Atualiza o mapa com as RUAS e NÓS e reconstroí o dock
-        self._on_node_added_and_state_updated(lines_gdf, points_gdf)
+        # Atualiza o mapa e reconstroí o dock
+        self._on_node_added_and_state_updated(lines_df, points_df)
 
         # Reabilita a GUI
         self.load_gpkg_action.setEnabled(True)
@@ -762,7 +744,7 @@ class MainWindow(QMainWindow):
         APENAS EMITE SINAIS DE REQUISIÇÃO.
         """
         # Verifica se temos um estado carregado (usando as cópias locais)
-        if self.processed_streets_gdf is None or self.processed_points_gdf is None:
+        if self.processed_streets_df is None or self.processed_points_df is None:
             print("Clique ignorado, estado não está pronto.")
             return
 
@@ -777,10 +759,14 @@ class MainWindow(QMainWindow):
         # --- Seleção/Inserção de Nós ---
         elif self.radio_select_nodes.isChecked():
             if layer_name == "nodes":
+                node_mask = self.processed_points_df['node_index'] == feature_id
+                if not node_mask.any():
+                    return
+                
                 # Validação: Não pode ser Depósito
-                node_row = self.processed_points_gdf[self.processed_points_gdf['node_index'] == feature_id].iloc[0]
+                node_row = self.processed_points_df[node_mask].iloc[0]
                 if node_row.get('depot') == 'yes':
-                    QMessageBox.warning(self, "Ação Inválida", "Um Depósito não pode ser marcado como Requerido.")
+                    QMessageBox.warning(self, "Ação Inválida", "Depósito não pode ser marcado como Requerido.")
                     return
                 
                 # Se for marcar como requerido (atualmente 'no'), pede custo
@@ -803,11 +789,14 @@ class MainWindow(QMainWindow):
         # --- Selecionar Depósito ---
         elif self.radio_select_depot.isChecked():
             if layer_name == "nodes":
-                # Validação: Não pode ser Requerido
-                node_row = self.processed_points_gdf[self.processed_points_gdf['node_index'] == feature_id].iloc[0]
+                node_mask = self.processed_points_df['node_index'] == feature_id
+                if not node_mask.any():
+                    return
 
+                # Validação: Não pode ser Requerido
+                node_row = self.processed_points_df[node_mask].iloc[0]
                 if node_row.get('eh_requerido') == 'yes':
-                    QMessageBox.warning(self, "Ação Inválida", "Um nó Requerido não pode ser definido como Depósito.")
+                    QMessageBox.warning(self, "Ação Inválida", "Nó Requerido não pode ser definido como Depósito.")
                     return
 
                 self.set_depot_request.emit(feature_id)
@@ -821,7 +810,7 @@ class MainWindow(QMainWindow):
         Recebe os limites (lat/lon) do retângulo.
         APENAS EMITE SINAIS DE REQUISIÇÃO.
         """
-        if (self.processed_streets_gdf is None or self.radio_select_depot.isChecked()):
+        if (self.processed_streets_df is None or self.radio_select_depot.isChecked()):
             print("Seleção em caixa ignorada (pipeline não pronto ou modo depósito ativo).")
             return
 
@@ -839,8 +828,8 @@ class MainWindow(QMainWindow):
             print(f"Erro ao criar 'box' de seleção: {e}")
             traceback.print_exc()
     
-    @Slot(gpd.GeoDataFrame, gpd.GeoDataFrame)
-    def _on_node_added_and_state_updated(self, map_streets_gdf: gpd.GeoDataFrame, map_points_gdf: gpd.GeoDataFrame):
+    @Slot(pd.DataFrame, pd.DataFrame)
+    def _on_node_added_and_state_updated(self, map_streets_df: pd.DataFrame, map_points_df: pd.DataFrame):
         """
         Recebe os GDFs atualizados do worker, força a re-renderização
         do mapa e reconstrói o dock de detalhes.
@@ -851,14 +840,19 @@ class MainWindow(QMainWindow):
         self._set_interaction_enabled(False)
         
         # Armazena as cópias locais
-        self.processed_streets_gdf = map_streets_gdf
-        self.processed_points_gdf = map_points_gdf
+        self.processed_streets_df = map_streets_df
+        self.processed_points_df = map_points_df
+
+        current_crs = self.pipeline_worker.pipeline.state.crs
         
-        # Força a re-renderização do mapa com os novos dados
+        ms_gdf = GeoFactory.to_gdf(map_streets_df, current_crs)
+        mp_gdf = GeoFactory.to_gdf(map_points_df, current_crs)
+        
+        # Atualiza o mapa
         self.map_widget.update_layers(
             neighborhoods_gdf=self.file_manager.neighborhoods_gdf,
-            streets_gdf=self.processed_streets_gdf,
-            points_gdf=self.processed_points_gdf
+            streets_gdf=ms_gdf,
+            points_gdf=mp_gdf
         )
         
         # Reconstrói o dock de detalhes
@@ -867,36 +861,35 @@ class MainWindow(QMainWindow):
         # Reabilitando UI
         self._set_interaction_enabled(True)
         
-        print("MainWindow: Mapa e dock atualizados.")
+        print("MainWindow: Visualização atualizada.")
 
     @Slot(int, str, dict)
     def _on_street_toggled(self, street_id: int, new_status: str, row_data: dict):
         """Atualiza a UI (mapa e dock) quando o worker confirma a mudança da RUA."""
         try:
-            if new_status == 'yes':
-                color = '#FFFF00'       # Amarelo
-                action = 'add'
-            else:       # 'no'
-                color = '#db1e2a'       # Vermelho (padrão)
-                action = 'remove'
+            color = '#FFFF00' if new_status == 'yes' else '#db1e2a'
+            action = 'add' if new_status == 'yes' else 'remove'
 
-            # Atualiza cor no mapa (via JS, rápido)
+            # Atualiza cor no mapa (via JS)
             self.map_widget.update_street_color(street_id, color)
             
-            # Atualiza GDF local (para o dock)
-            if self.processed_streets_gdf is not None:
-                map_index = self.processed_streets_gdf.loc[self.processed_streets_gdf['id'] == street_id].index
-                if not map_index.empty:
-                    self.processed_streets_gdf.loc[map_index, 'eh_requerido'] = new_status
-                    self.processed_streets_gdf.loc[map_index, 'demanda'] = 1 if new_status == 'yes' else 0
-                    # Pega a geometria do GDF de mapa (para o zoom)
-                    row_data['geometry'] = self.processed_streets_gdf.loc[map_index[0], 'geometry']
+            # Atualiza DataFrame local
+            if self.processed_streets_df is not None:
+                mask = self.processed_streets_df['id'] == street_id
+
+                if mask.any():
+                    idx = self.processed_streets_df[mask].index
+
+                    self.processed_streets_df.loc[idx, 'eh_requerido'] = new_status
+                    self.processed_streets_df.loc[idx, 'demanda'] = 1 if new_status == 'yes' else 0
+                    # Obtém a geometria do GDF de mapa (para o zoom)
+                    row_data['geometry'] = self.processed_streets_df.loc[idx[0], 'geometry']
             
             row_series = pd.Series(row_data)
 
             # Atualiza o dock
             if action == 'add':
-                self._add_item_to_details_dock(row_series, f"rua_{street_id}", is_depot=False)
+                self._add_item_to_details_dock(row_series, f"rua_{street_id}", False)
             else:
                 self._remove_item_from_details_dock(f"rua_{street_id}")
                 
@@ -908,33 +901,31 @@ class MainWindow(QMainWindow):
     def _on_node_toggled(self, node_id: int, new_status: str, row_data: dict):
         """Atualiza a UI (mapa e dock) quando o worker confirma a mudança do NÓ."""
         try:
-            if new_status == 'yes':
-                color = '#FFFF00' # Amarelo
-                action = 'add'
-            else: # 'no'
-                color = 'blue' # Azul (padrão)
-                action = 'remove'
+            color = '#FFFF00' if new_status == 'yes' else 'blue'
+            action = 'add' if new_status == 'yes' else 'remove'
             
-            # Atualiza GDF local (para o dock)
-            if self.processed_points_gdf is not None:
-                map_mask = self.processed_points_gdf['node_index'] == node_id
-                if map_mask.any():
-                    self.processed_points_gdf.loc[map_mask, 'eh_requerido'] = new_status
-                    self.processed_points_gdf.loc[map_mask, 'demanda'] = 1 if new_status == 'yes' else 0
-                    # Pega a geometria (para o zoom)
-                    row_data['geometry'] = self.processed_points_gdf[map_mask].iloc[0]['geometry']
-            
-            # Atualiza cor no mapa (via JS)
-            # Apenas mude a cor se NÃO for o depósito atual
-            is_depot = self.processed_points_gdf.loc[self.processed_points_gdf['node_index'] == node_id, 'depot'].iloc[0] == 'yes'
-            if not is_depot:
-                self.map_widget.update_node_style(node_id, color, color)
+            # Atualiza DataFrame local
+            if self.processed_points_df is not None:
+                mask = self.processed_points_df['node_index'] == node_id
+
+                if mask.any():
+                    idx = self.processed_points_df[mask].index
+
+                    self.processed_points_df.loc[mask, 'eh_requerido'] = new_status
+                    self.processed_points_df.loc[mask, 'demanda'] = 1 if new_status == 'yes' else 0
+                    # Obtém a geometria (para o zoom)
+                    row_data['geometry'] = self.processed_streets_df.loc[idx[0], 'geometry']
+
+                    # Verifica depósito para cor
+                    is_depot = self.processed_points_df.loc[idx[0], 'depot'] == 'yes'
+                    if not is_depot:
+                        self.map_widget.update_node_style(node_id, color, color)
 
             row_series = pd.Series(row_data)
 
             # Atualiza o dock
             if action == 'add':
-                self._add_item_to_details_dock(row_series, f"no_{node_id}", is_depot=False)
+                self._add_item_to_details_dock(row_series, f"no_{node_id}", False)
             else:
                 self._remove_item_from_details_dock(f"no_{node_id}")
 
@@ -947,32 +938,33 @@ class MainWindow(QMainWindow):
         """Atualiza a UI para mudança de depósito."""
         try:
             # --- Lida com o Antigo Depósito (se houver) ---
-            if old_id != None and old_id != -1:
+            if old_id != None and old_id != -1 and self.processed_points_df is not None:
                 self._remove_item_from_details_dock(f"deposito_{old_id}")
                 
-                # Reseta GDF local
-                old_mask_map = (self.processed_points_gdf['node_index'] == old_id)
-                self.processed_points_gdf.loc[old_mask_map, 'depot'] = 'no'
+                # Reseta DataFrame local
+                mask_old = self.processed_points_df['node_index'] == old_id
+                if mask_old.any():
+                    self.processed_points_df.loc[mask_old, 'depot'] = 'no'
                 
-                # Reseta cor (via JS)
-                is_required = self.processed_points_gdf[old_mask_map].iloc[0].get('eh_requerido', 'no') == 'yes'
-                color = '#FFFF00' if is_required else 'blue'
-                self.map_widget.update_node_style(old_id, color, color)
+                    # Reseta cor (via JS)
+                    is_req = self.processed_points_df.loc[mask_old, 'eh_requerido'].iloc[0] == 'yes'
+                    color = '#FFFF00' if is_req else 'blue'
+                    self.map_widget.update_node_style(old_id, color, color)
 
             # --- Lida com o Novo Depósito (se houver) ---
-            if new_id != None and new_id != -1:
-                # Atualiza GDF local
-                new_mask_map = (self.processed_points_gdf['node_index'] == new_id)
-                self.processed_points_gdf.loc[new_mask_map, 'depot'] = 'yes'
-                new_row_data['geometry'] = self.processed_points_gdf[new_mask_map].iloc[0]['geometry']
+            if new_id != None and new_id != -1 and self.processed_points_df is not None:
+                # Atualiza DataFrame local
+                mask_new = self.processed_points_df['node_index'] == new_id
 
-                row_series = pd.Series(new_row_data)
-                
-                # Atualiza cor (via JS)
-                self.map_widget.update_node_style(new_id, '#800080', '#800080')     # Roxo
-                # Atualiza dock
-                self._add_item_to_details_dock(row_series, f"deposito_{new_id}", is_depot=True)
-                self.current_depot_info = {'id': new_id}
+                if mask_new.any():
+                    self.processed_points_df.loc[mask_new, 'depot'] = 'yes'
+                    new_row_data['geometry'] = self.processed_points_df.loc[mask_new].iloc[0]['geometry']
+
+                    # Atualiza cor (via JS)
+                    self.map_widget.update_node_style(new_id, '#800080', '#800080')     # Roxo
+                    # Atualiza dock
+                    self._add_item_to_details_dock(pd.Series(new_row_data), f"deposito_{new_id}", True)
+                    self.current_depot_info = {'id': new_id}
             else:
                 # (Caso de deseleção)
                 self.current_depot_info = None
@@ -993,28 +985,25 @@ class MainWindow(QMainWindow):
             
         self.details_list_widget.clear()
         
-        # Adiciona o Depósito (se existir)
-        if self.processed_points_gdf is not None:
-            depot_mask = self.processed_points_gdf['depot'] == 'yes'
+        if self.processed_points_df is not None:
+            # Depósito
+            depot_mask = self.processed_points_df['depot'] == 'yes'
             if depot_mask.any():
-                depot_row = self.processed_points_gdf[depot_mask].iloc[0]
-                self._add_item_to_details_dock(depot_row, f"deposito_{depot_row['node_index']}", is_depot=True)
+                depot_row = self.processed_points_df[depot_mask].iloc[0]
+                self._add_item_to_details_dock(depot_row, f"deposito_{depot_row['node_index']}", True)
 
-        # Adiciona Nós Requeridos (que não são o depósito)
-        if self.processed_points_gdf is not None:
-            nodes_mask = (self.processed_points_gdf['eh_requerido'] == 'yes') & \
-                         (self.processed_points_gdf['depot'] != 'yes')
-            if nodes_mask.any():
-                # Pega apenas uma linha por nó (GDF de mapa é único por node_index)
-                for index, node_row in self.processed_points_gdf[nodes_mask].iterrows():
-                    self._add_item_to_details_dock(node_row, f"no_{node_row['node_index']}", is_depot=False)
+            # Nós Requeridos
+            nodes_mask = (self.processed_points_df['eh_requerido'] == 'yes') & \
+                         (self.processed_points_df['depot'] != 'yes')
+            # Pega apenas uma linha por nó (GDF de mapa é único por node_index)
+            for _, node_row in self.processed_points_df[nodes_mask].iterrows():
+                self._add_item_to_details_dock(node_row, f"no_{node_row['node_index']}", False)
 
-        # Adiciona Ruas Requeridas
-        if self.processed_streets_gdf is not None:
-            streets_mask = self.processed_streets_gdf['eh_requerido'] == 'yes'
-            if streets_mask.any():
-                for index, street_row in self.processed_streets_gdf[streets_mask].iterrows():
-                    self._add_item_to_details_dock(street_row, f"rua_{street_row['id']}", is_depot=False)
+        # Ruas Requeridas
+        if self.processed_streets_df is not None:
+            streets_mask = self.processed_streets_df['eh_requerido'] == 'yes'
+            for _, street_row in self.processed_streets_df[streets_mask].iterrows():
+                self._add_item_to_details_dock(street_row, f"rua_{street_row['id']}", False)
     
     def _add_item_to_details_dock(self, row: pd.Series, item_key: str, is_depot: bool):
         """Cria o 'card' e o adiciona no dock de Detalhes."""
@@ -1090,15 +1079,15 @@ class MainWindow(QMainWindow):
     @Slot()
     def _on_finalize_clicked(self):
         """Valida o grafo e inicia o processo de salvamento."""
-        if self.processed_points_gdf is None or self.processed_streets_gdf is None:
+        if self.processed_points_df is None or self.processed_streets_df is None:
             return
 
         # Verifica Depósito
-        has_depot = (self.processed_points_gdf['depot'] == 'yes').any()
+        has_depot = (self.processed_points_df['depot'] == 'yes').any()
         
         # Verifica Requeridos (Nós OU Ruas)
-        has_req_node = (self.processed_points_gdf['eh_requerido'] == 'yes').any()
-        has_req_street = (self.processed_streets_gdf['eh_requerido'] == 'yes').any()
+        has_req_node = (self.processed_points_df['eh_requerido'] == 'yes').any()
+        has_req_street = (self.processed_streets_df['eh_requerido'] == 'yes').any()
         
         if not has_depot:
             QMessageBox.warning(self, "Impossível Finalizar", "A instância precisa ter um <b>Depósito</b> definido.")
@@ -1148,10 +1137,8 @@ class MainWindow(QMainWindow):
     @Slot(bool)
     def _on_bairros_visibility_changed(self, checked: bool):
         """Chamado quando a checkbox 'Exibir Bairros' é marcada/desmarcada."""
-        if not self.map_widget:
-            return
-        
-        self.map_widget.set_neighborhood_visibility(checked)
+        if self.map_widget:
+            self.map_widget.set_neighborhood_visibility(checked)
 
     @Slot(QListWidgetItem)
     def _on_details_item_clicked(self, item: QListWidgetItem):
@@ -1176,10 +1163,7 @@ class MainWindow(QMainWindow):
     def _on_pointer_mode_changed(self, button: QAbstractButton, checked: bool):
         """Chamado quando o 'pointer_mode_group' (Ponteiro ou Caixa) muda."""
         # Só nos importa o botão que foi LIGADO
-        if not checked:
-            return
-            
-        if not self.map_widget:
+        if not checked or not self.map_widget:
             return
 
         if button == self.radio_pointer_mode:
@@ -1195,7 +1179,7 @@ class MainWindow(QMainWindow):
         Acionado pelo menu Ferramentas > Reduzir Grafo.
         Solicita ao worker que filtre os bairros irrelevantes.
         """
-        if self.processed_streets_gdf is None:
+        if self.processed_streets_df is None:
             QMessageBox.warning(self, "Aviso", "Nenhum mapa carregado para reduzir.")
             return
 
@@ -1219,7 +1203,7 @@ class MainWindow(QMainWindow):
     @Slot()
     def _on_create_files_triggered(self):
         """Abre diálogos para criar arquivos .dat."""
-        if self.processed_points_gdf is None:
+        if self.processed_points_df is None:
             QMessageBox.warning(self, "Aviso", "Nenhuma instância carregada.")
             return
             
@@ -1231,10 +1215,7 @@ class MainWindow(QMainWindow):
         veh, ok = QInputDialog.getInt(self, "Configuração da Instância", "Quantidade de Veículos:", 1, 1, 100)
         if not ok: return
         
-        # Pergunta Nome do Arquivo
-        default_name = "instancia"
-        
-        name, ok = QInputDialog.getText(self, "Configuração da Instância", "Nome base do arquivo:", text=default_name)
+        name, ok = QInputDialog.getText(self, "Configuração da Instância", "Nome base do arquivo:", text="instancia")
         if not ok or not name.strip(): return
         
         self.statusBar().showMessage("Gerando arquivos de instância...")

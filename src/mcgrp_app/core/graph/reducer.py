@@ -4,10 +4,10 @@ import math
 import numpy as np
 import pandas as pd
 import geopandas as gpd
-from typing import Optional
+from typing import Optional, Tuple
 from shapely.geometry import LineString
 
-from ..utils import GeoCalculator, GraphState
+from ..utils import GeoCalculator, GraphState, GeoFactory
 
 class ReducedGraphProcessor:
     """
@@ -15,10 +15,9 @@ class ReducedGraphProcessor:
     e mesclar ruas em fronteiras de bairros.
     """
 
-    def __init__(self, neighborhoods_gdf: gpd.GeoDataFrame):
+    def __init__(self, neighborhoods_df: pd.DataFrame):
         self.BASE_CRS = GeoCalculator.BASE_CRS
         self.PROJECTED_CRS = GeoCalculator.PROJECTED_CRS
-        self.neighborhoods_gdf = neighborhoods_gdf
         
         # Estruturas auxiliares
         self._points_by_line = {}
@@ -26,8 +25,17 @@ class ReducedGraphProcessor:
         self._points_by_coord = {}
         self.next_temp_line_id = 1
 
-        # Cache de projeção
-        self.neighborhoods_gdf_proj = self.neighborhoods_gdf.to_crs(self.PROJECTED_CRS)
+        # Cache de projeção dos bairros
+        neigh_gdf = GeoFactory.to_gdf(neighborhoods_df, self.BASE_CRS)
+        self.neighborhoods_gdf_proj = neigh_gdf.to_crs(self.PROJECTED_CRS)
+        
+        # Mapa de nomes
+        self.neighborhoods_df = neighborhoods_df
+        # Garante que 'id_bairro' e 'bairro' existam
+        if 'id_bairro' in neighborhoods_df.columns and 'bairro' in neighborhoods_df.columns:
+            self.bairro_name_map = neighborhoods_df.set_index('id_bairro')['bairro'].to_dict()
+        else:
+            self.bairro_name_map = {}
 
     def _build_auxiliary_structures(self, state: GraphState):
         """Constrói mapas em memória a partir do estado atual."""
@@ -48,7 +56,7 @@ class ReducedGraphProcessor:
             for row in state.data_streets.itertuples()
         }
 
-        # Mapeia coord_tuple -> [lista_de_indices_GDF]
+        # Mapeia coord_tuple -> [lista_de_indices_DF]
         temp_points_by_coord = {}
         
         # Constrói mapa de pontos por coordenada
@@ -63,54 +71,56 @@ class ReducedGraphProcessor:
     
     def create_reduced_graph(self, state: GraphState) -> GraphState:
         """
-        Método orquestrador: Reduz o grafo lógico (data_gdf).
+        Método orquestrador: Reduz o grafo lógico (data_df).
         """
         self._build_auxiliary_structures(state)
         
         points_to_keep_indices = set()
         
         # Itera sobre cada linha e seus pontos associados
-        for line_id, points_gdf in self._points_by_line.items():
+        for line_id, points_df in self._points_by_line.items():
             
             # Identifica os índices (0, 1, 2...) dos pontos especiais
-            special_indices = self._find_special_indices(points_gdf)
+            special_indices = self._find_special_indices(points_df)
 
             # Se a linha não pode ser reduzida, marca todos os pontos para manter
             if len(special_indices) < 2:
-                points_to_keep_indices.update(points_gdf.index)
+                points_to_keep_indices.update(points_df.index)
                 continue
 
             # Processa os segmentos entre pontos especiais
-            kept_indices = self._process_line_segments(points_gdf, special_indices, line_id, state)
+            kept_indices = self._process_line_segments(points_df, special_indices, line_id, state)
             points_to_keep_indices.update(kept_indices)
 
-        # Filtra o GDF de pontos final
-        print(f"  Reducer: Grafos de dados reduzidos de {len(state.data_points)} para {len(points_to_keep_indices)} pontos.")
+        # Filtra o DF de pontos final
+        print(f"  Reducer: Grafo de dados reduzido de {len(state.data_points)} para {len(points_to_keep_indices)} pontos.")
         state.data_points = state.data_points.loc[list(points_to_keep_indices)].copy()
         
-        # Reconstrói o GDF de pontos (agora reduzido) para re-indexar 'vertex_index'
+        # Reconstrói o DF de pontos para re-indexar 'vertex_index'
         state.data_points = self._reindex_reduced_points(state.data_points)
 
         return state
 
-    def _find_special_indices(self, points_gdf: gpd.GeoDataFrame) -> list:
+    def _find_special_indices(self, points_df: pd.DataFrame) -> list:
         """
         Encontra os índices da linha (0, 1, 2...N-1) dos pontos especiais.
         """
-        is_special = (points_gdf['eh_extremidade'] == 'yes') | (points_gdf['eh_unido'] == 'yes')
+        is_extremidade = points_df['eh_extremidade'] == 'yes'
+        is_unido = points_df['eh_unido'] == 'yes'
+        
+        is_special = is_extremidade | is_unido
         
         # Retorna os índices da linha (vertex_index)
-        return points_gdf[is_special]['vertex_index'].tolist()
+        return points_df[is_special]['vertex_index'].tolist()
     
-    def _process_line_segments(self, points_gdf: gpd.GeoDataFrame, special_indices: list, line_id: int, state: GraphState) -> set:
+    def _process_line_segments(self, points_df: pd.DataFrame, special_indices: list, line_id: int, state: GraphState) -> set:
         """
-        Itera sobre os segmentos (entre nós especiais), calcula atributos
-        acumulados e atualiza os GDFs de dados.
+        Itera sobre os segmentos, calcula atributos acumulados e atualiza o estado.
         """
         kept_indices = set()        # Índices do GDF de pontos a manter
         
         # Converte para dicts
-        points_list = points_gdf.to_dict('records')
+        points_list = points_df.to_dict('records')
         # Mapeia vertex_index -> dict (para acesso não sequencial)
         points_map = {p['vertex_index']: p for p in points_list}
 
@@ -132,7 +142,7 @@ class ReducedGraphProcessor:
                 if m > i_v_index and m < j_v_index:
                     intermediate_coordinates.append(point_m['geometry'].coords[0])
 
-                dist_total_km += point_m["distance"]
+                dist_total_km += point_m.get("distance", 0.0)
                 angle = point_m.get("angle")
                 angle_inv = point_m.get("angle_inv")
                 
@@ -145,18 +155,18 @@ class ReducedGraphProcessor:
             avg_angle = GeoCalculator.mean_angle_deg(angles)
             avg_angle_inv = GeoCalculator.mean_angle_deg(angles_inv)
 
-            # Atualiza atributos no GDF de pontos
+            # Atualiza atributos no DataFrame do estado diretamente
             # Atualiza ponto i (início do segmento)
-            i_point_idx = points_gdf.iloc[i_v_index].name
+            i_point_idx = points_df.iloc[i_v_index].name
             if avg_angle is not None:
-                state.data_points.loc[i_point_idx, 'angle'] = round(avg_angle, GeoCalculator.PRECISION_DIGITS)
+                state.data_points.at[i_point_idx, 'angle'] = round(avg_angle, GeoCalculator.PRECISION_DIGITS)
             if avg_angle_inv is not None:
-                state.data_points.loc[i_point_idx, 'angle_inv'] = round(avg_angle_inv, GeoCalculator.PRECISION_DIGITS)
+                state.data_points.at[i_point_idx, 'angle_inv'] = round(avg_angle_inv, GeoCalculator.PRECISION_DIGITS)
 
             # Atualiza ponto j (fim do segmento)
-            j_point_idx = points_gdf.iloc[j_v_index].name
-            state.data_points.loc[j_point_idx, 'vertex_to'] = i_v_index
-            state.data_points.loc[j_point_idx, 'distance'] = round(dist_total_km, GeoCalculator.PRECISION_DIGITS)
+            j_point_idx = points_df.iloc[j_v_index].name
+            state.data_points.at[j_point_idx, 'vertex_to'] = i_v_index
+            state.data_points.at[j_point_idx, 'distance'] = round(dist_total_km, GeoCalculator.PRECISION_DIGITS)
             
             # Marca os dois pontos para manter
             kept_indices.add(i_point_idx)
@@ -164,7 +174,7 @@ class ReducedGraphProcessor:
 
         return kept_indices
     
-    def _reindex_reduced_points(self, data_points_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    def _reindex_reduced_points(self, data_points_df: pd.DataFrame) -> pd.DataFrame:
         """
         Após a redução, os 'vertex_index' dos pontos restantes (ex: 0, 5, 8) 
         são re-indexados para (0, 1, 2) para cada rua.
@@ -175,7 +185,7 @@ class ReducedGraphProcessor:
         new_points_list = []
         
         # Itera sobre os grupos
-        for line_id, group in data_points_gdf.groupby('from_line_id'):
+        for line_id, group in data_points_df.groupby('from_line_id'):
             # Garante a ordem correta
             group = group.sort_values('vertex_index')
             
@@ -202,10 +212,7 @@ class ReducedGraphProcessor:
                 new_points_list.append(row)
         
         # Reconstrói o GDF
-        return gpd.GeoDataFrame(
-            new_points_list, 
-            crs=data_points_gdf.crs
-        )
+        return pd.DataFrame(new_points_list)
     
     def remove_boundary_vertices(self, state: GraphState) -> GraphState:
         """
@@ -233,7 +240,7 @@ class ReducedGraphProcessor:
         
         if not boundary_pairs:
             print("  Nenhum vértice de fronteira para mesclar.")
-            return
+            return state
 
         # Conjuntos para rastrear o que foi modificado/removido
         lines_to_remove_idx = set()
@@ -271,23 +278,16 @@ class ReducedGraphProcessor:
 
         # Adiciona as novas features
         if new_data_streets_list:
-            state.data_streets = pd.concat(
-                [state.data_streets, gpd.GeoDataFrame(new_data_streets_list, crs=state.data_streets.crs)],
-                ignore_index=True
-            )
-            state.map_streets = pd.concat(
-                [state.map_streets, gpd.GeoDataFrame(new_map_streets_list, crs=state.map_streets.crs)],
-                ignore_index=True
-            )
-            state.data_points = pd.concat(
-                [state.data_points, gpd.GeoDataFrame(new_data_points_list, crs=state.data_points.crs)],
-                ignore_index=True
-            )
+            new_data_streets_df = pd.DataFrame(new_data_streets_list)
+            new_map_streets_df = pd.DataFrame(new_map_streets_list)
+            new_data_points_df = pd.DataFrame(new_data_points_list)
 
-        # Reindexa tudo
-        if new_data_streets_list:
-            print("  Re-indexando GDFs pós-mesclagem...")
-            self._reindex_all_gdfs(state)
+            state.data_streets = pd.concat([state.data_streets, new_data_streets_df], ignore_index=True)
+            state.map_streets = pd.concat([state.map_streets, new_map_streets_df], ignore_index=True)
+            state.data_points = pd.concat([state.data_points, new_data_points_df], ignore_index=True)
+
+            print("  Re-indexando DFs pós-mesclagem...")
+            self._reindex_all_dfs(state)
 
         return state
 
@@ -322,7 +322,7 @@ class ReducedGraphProcessor:
             
         return None
     
-    def _calculate_new_avg_angles(self, *points_rows) -> tuple:
+    def _calculate_new_avg_angles(self, *points_rows) -> Tuple[Optional[float], Optional[float]]:
         """
         Calcula ângulos médios acumulados para um conjunto de 'point rows'.
         """
@@ -359,8 +359,8 @@ class ReducedGraphProcessor:
         line1_id = pt1_row['from_line_id']
         line2_id = pt2_row['from_line_id']
         
-        line1_gdf_idx = self._lines_by_id.get(line1_id)
-        line2_gdf_idx = self._lines_by_id.get(line2_id)
+        line1_idx = self._lines_by_id.get(line1_id)
+        line2_idx = self._lines_by_id.get(line2_id)
 
         # Encontra os outros pontos (A e C)
         other_pt1_idx = self._find_other_extreme_point_idx(line1_id, pt1_row.name)
@@ -372,14 +372,14 @@ class ReducedGraphProcessor:
         other_pt1_row = state.data_points.loc[other_pt1_idx]
         other_pt2_row = state.data_points.loc[other_pt2_idx]
         
-        line1_row = state.data_streets.loc[line1_gdf_idx]
-        line2_row = state.data_streets.loc[line2_gdf_idx]
-        line1_map_row = state.map_streets.loc[line1_gdf_idx]
-        line2_map_row = state.map_streets.loc[line2_gdf_idx]
+        line1_row = state.data_streets.loc[line1_idx]
+        line2_row = state.data_streets.loc[line2_idx]
+        line1_map_row = state.map_streets.loc[line1_idx]
+        line2_map_row = state.map_streets.loc[line2_idx]
 
         # Marca itens antigos para remoção
-        lines_to_remove_idx.add(line1_gdf_idx)
-        lines_to_remove_idx.add(line2_gdf_idx)
+        lines_to_remove_idx.add(line1_idx)
+        lines_to_remove_idx.add(line2_idx)
         points_to_remove_idx.add(pt1_row.name)
         points_to_remove_idx.add(pt2_row.name)
         points_to_remove_idx.add(other_pt1_idx)
@@ -397,7 +397,7 @@ class ReducedGraphProcessor:
             pt1_row, pt2_row, other_pt1_row, other_pt2_row
         )
 
-        # Determina a orientação correta
+        # Determina a orientação
         if other_pt1_row['vertex_index'] == 0:
             first_vertex_row = other_pt1_row
             second_vertex_row = other_pt2_row
@@ -480,12 +480,13 @@ class ReducedGraphProcessor:
         del self._lines_by_id[line1_id]
         del self._lines_by_id[line2_id]
 
-    def _get_dominant_bairro(self, line_geom: LineString) -> tuple:
+    def _get_dominant_bairro(self, line_geom: LineString) -> Tuple[Optional[int], Optional[str]]:
         """Reatribui o bairro de uma rua."""
         try:
-            line_gdf_proj = gpd.GeoDataFrame(
+            line_gdf = gpd.GeoDataFrame(
                 geometry=[line_geom], crs=self.BASE_CRS
-            ).to_crs(self.PROJECTED_CRS)
+            )
+            line_gdf_proj = line_gdf.to_crs(self.PROJECTED_CRS)
 
             intersection_gdf = gpd.overlay(
                 line_gdf_proj, 
@@ -502,15 +503,13 @@ class ReducedGraphProcessor:
             lengths_by_bairro = intersection_gdf.groupby('id_bairro')['length_m'].sum()
             
             new_bairro_id = lengths_by_bairro.idxmax()
-            new_bairro_name = self.neighborhoods_gdf[
-                self.neighborhoods_gdf['id_bairro'] == new_bairro_id
-            ]['bairro'].iloc[0]
+            new_bairro_name = self.bairro_name_map.get(new_bairro_id)
             
             return (new_bairro_id, new_bairro_name)
         except Exception:
             return (None, None)
         
-    def _reindex_all_gdfs(self, state: GraphState) -> GraphState:
+    def _reindex_all_dfs(self, state: GraphState) -> GraphState:
         """Re-indexa 'id' e propaga para 'from_line_id'."""
         
         # Reseta o índice principal (0 a N-1)
@@ -535,3 +534,5 @@ class ReducedGraphProcessor:
         state.data_points = state.data_points[
             state.data_points['from_line_id'].isin(valid_line_ids)
         ].copy()
+
+        return state

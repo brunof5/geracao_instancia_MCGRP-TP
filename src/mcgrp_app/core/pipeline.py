@@ -1,7 +1,6 @@
 # src\mcgrp_app\core\pipeline.py
 
 import pandas as pd
-import geopandas as gpd
 import traceback
 from typing import Optional
 
@@ -21,8 +20,8 @@ class GeoPipeline(QObject):
 
     # (passo_atual, total_passos, descrição)
     progress_update = Signal(int, int, str)
-    # (gdf_ruas, gdf_pontos, mensagem, estatísticas)
-    processing_complete = Signal(gpd.GeoDataFrame, gpd.GeoDataFrame, str, dict)
+    # (df_ruas, df_pontos, mensagem, estatísticas)
+    processing_complete = Signal(pd.DataFrame, pd.DataFrame, str, dict)
     # (mensagem)
     processing_error = Signal(str)
 
@@ -54,12 +53,20 @@ class GeoPipeline(QObject):
         ]
         self.total_steps = len(self.step_titles)
     
-    def _validate_inputs(self, streets_gdf: gpd.GeoDataFrame, neighborhoods_gdf: gpd.GeoDataFrame):
-        """Valida os GDFs de entrada."""
-        if not isinstance(streets_gdf, gpd.GeoDataFrame) or streets_gdf.empty:
-            raise ValueError("GeoDataFrame de Ruas é inválido ou está vazio.")
-        if not isinstance(neighborhoods_gdf, gpd.GeoDataFrame) or neighborhoods_gdf.empty:
-            raise ValueError("GeoDataFrame de Bairros é inválido ou está vazio.")
+    def _validate_inputs(self, streets_df: pd.DataFrame, neighborhoods_df: pd.DataFrame):
+        """Valida os DataFrames de entrada."""
+        if streets_df is None or streets_df.empty:
+            raise ValueError("DataFrame de Ruas é inválido ou está vazio.")
+        
+        if 'geometry' not in streets_df.columns:
+             raise ValueError("DataFrame de Ruas não possui coluna 'geometry'.")
+
+        if neighborhoods_df is None or neighborhoods_df.empty:
+            raise ValueError("DataFrame de Bairros é inválido ou está vazio.")
+            
+        if 'geometry' not in neighborhoods_df.columns:
+             raise ValueError("DataFrame de Bairros não possui coluna 'geometry'.")
+        
         print("Validação de entrada do pipeline concluída com sucesso.")
     
     def _preformat_tooltips(self, state: GraphState) -> GraphState:
@@ -76,11 +83,11 @@ class GeoPipeline(QObject):
             )
             
             def format_rua_html(row):
-                oneway = (row.get('oneway', 'no') or 'no').lower()
+                oneway = (str(row.get('oneway', 'no')) or 'no').lower()
                 if oneway in ['yes', '1', 'true']:
-                    header = f"<b>Arco:</b> {row['arc_index']} (De: {row['from_node']}, Para: {row['to_node']})"
+                    header = f"<b>Arco:</b> {row.get('arc_index', '?')} (De: {row.get('from_node', '?')}, Para: {row.get('to_node', '?')})"
                 else:
-                    header = f"<b>Aresta:</b> {row['edge_index']}"
+                    header = f"<b>Aresta:</b> {row.get('edge_index', '?')}"
                 
                 rua = row.get('name', 'desconhecida')
                 bairro = row.get('bairro', 'N/A')
@@ -118,6 +125,7 @@ class GeoPipeline(QObject):
             
         return state
     
+    '''
     def export_data(self, filename: str, field_config_type: FieldConfigType):
         """
         Exporta os GDFs do estado atual para arquivos GeoPackage.
@@ -159,10 +167,11 @@ class GeoPipeline(QObject):
             print(f"  Erro durante a exportação de depuração: {e}")
             traceback.print_exc()
             self.processing_error.emit(f"Falha ao exportar dados de depuração: {e}")
+    '''
     
     def _save_to_database(self, state: GraphState, status: str, run_name: str) -> GraphState:
         """
-        Usa o FileManager para salvar os GDFs (e bairros) em arquivos .gpkg
+        Usa o FileManager para salvar os DataFrames em arquivos .gpkg
         e usa o DBManager para registrar esses arquivos no catálogo.
         """
 
@@ -189,7 +198,7 @@ class GeoPipeline(QObject):
         }
         
         # Salva os arquivos .gpkg no disco
-        print(f"  Salvando GDFs em {self.db_manager.RUNS_DIR}...")
+        print(f"  Salvando arquivos em {self.db_manager.RUNS_DIR}...")
         try:
             FileManager.export_to_geopackage(
                 data_datasets, str(data_gpkg_path).replace(".gpkg", ""), field_config
@@ -314,8 +323,8 @@ class GeoPipeline(QObject):
     
     # --- SLOTS (Métodos que respondem a eventos) ---
     
-    @Slot(gpd.GeoDataFrame, gpd.GeoDataFrame, str)
-    def start_processing(self, streets_raw_gdf, neighborhoods_raw_gdf, base_run_name: str):
+    @Slot(pd.DataFrame, pd.DataFrame, str)
+    def start_processing(self, streets_raw_df, neighborhoods_raw_df, base_run_name: str):
         """
         Ponto de entrada do pipeline.
         Cria o estado e o passa pela cadeia de processamento.
@@ -325,14 +334,14 @@ class GeoPipeline(QObject):
 
         try:
             print("Pipeline: Processamento iniciado.")
-            self._validate_inputs(streets_raw_gdf, neighborhoods_raw_gdf)
-            stats['before_s'] = len(streets_raw_gdf)        # Contagem "Antes" (Ruas)
+            self._validate_inputs(streets_raw_df, neighborhoods_raw_df)
+            stats['before_s'] = len(streets_raw_df)        # Contagem "Antes" (Ruas)
 
             # Cria o objeto GraphState inicial
             self.state = GraphState(
-                data_streets=streets_raw_gdf.copy(),
-                map_streets=streets_raw_gdf.copy(),
-                neighborhoods=neighborhoods_raw_gdf,
+                data_streets=streets_raw_df.copy(),
+                map_streets=streets_raw_df.copy(),
+                neighborhoods=neighborhoods_raw_df,
                 data_points=None,
                 map_points=None
             )
@@ -387,7 +396,7 @@ class GeoPipeline(QObject):
 
             # --- FIM DO PRÉ-PROCESSAMENTO ---
 
-            print("\nPipeline: Garantindo a existência de demais colunas nos GDFs...")
+            print("\nPipeline: Garantindo a existência de demais colunas nos DFs...")
             self.state.data_streets = FieldsManager.ensure_fields_exist(
                 self.state.data_streets, FieldConfigType.EXTENDED
             )
@@ -414,7 +423,7 @@ class GeoPipeline(QObject):
             print("\nPipeline: Salvando no Banco de Dados...")
             self.state = self._save_to_database(self.state, "processado", base_run_name)
 
-            # Emite os GDFs de mapa para a GUI exibir
+            # Emite os DFs de mapa para a GUI exibir
             self.processing_complete.emit(
                 self.state.map_streets,
                 self.state.map_points,
