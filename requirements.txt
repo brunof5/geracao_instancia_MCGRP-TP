@@ -1,0 +1,9 @@
+# Lista de dependências Python (pip install -r)
+
+# --- GUI ---
+PySide6                 # O framework principal da GUI
+
+# --- Geoprocessamento e Mapas ---
+geopandas               # Para ler/escrever .gpkg e manipulação geoespacial
+folium                  # Para gerar os mapas interativos (HTML/JS)
+shapely                 # Dependência do geopandas para operações geométricas
