@@ -14,7 +14,7 @@ Este é o 1º componente de um conjunto de três repositórios que compõem toda
 
 2. [Modelagem Matemática](https://github.com/brunof5/modelagem_MCGRP-TP) (NEARP / NEARP-TP): Implementa os modelos exatos utilizados para análise comparativa.
 
-3. [Meta-Heurística HGS-CARP](https://github.com/brunof5/HGS-CARP): Implementação do algoritmo HGS-CARP adaptado para lidar com penalidades de conversão.
+3. [Meta-Heurística HGS-CARP](https://github.com/brunof5/HGS-CARP): Implementação do algoritmo HGS-CARP adaptado para lidar com penalidades de conversão no contexto do TCC.
 
 ## 🚀 Funcionalidades
 
