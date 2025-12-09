@@ -10,7 +10,7 @@ A aplicação permite carregar dados geoespaciais (camada dos bairros em `.shp` 
 
 Este é o 1º componente de um conjunto de três repositórios que compõem toda a solução do TCC:
 
-1. [Protótipo geoespacial](https://github.com/brunof5/geracao_instancia_MCGRP-TP) (este): Gera instâncias MCGRP/MCGRP-TP a partir de dados reais.
+1. [Protótipo Geoespacial](https://github.com/brunof5/geracao_instancia_MCGRP-TP): Gera instâncias MCGRP/MCGRP-TP a partir de dados reais.
 
 2. [Modelagem Matemática](https://github.com/brunof5/modelagem_MCGRP-TP) (NEARP / NEARP-TP): Implementa os modelos exatos utilizados para análise comparativa.
 
