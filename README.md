@@ -10,9 +10,9 @@ A aplicação permite carregar dados geoespaciais (camada dos bairros em `.shp` 
 
 Este é o 1º componente de um conjunto de três repositórios que compõem toda a solução do TCC:
 
-1. [Protótipo geoespacial](https://github.com/brunof5/tcc-prototipo) (este): Gera instâncias MCGRP/MCGRP-TP a partir de dados reais.
+1. [Protótipo geoespacial](https://github.com/brunof5/geracao_instancia_MCGRP-TP) (este): Gera instâncias MCGRP/MCGRP-TP a partir de dados reais.
 
-3. [Modelagem Matemática](https://github.com/brunof5/tcc-modelo) (NEARP / NEARP-TP): Implementa os modelos exatos utilizados para análise comparativa.
+3. [Modelagem Matemática](https://github.com/brunof5/modelagem_MCGRP-TP) (NEARP / NEARP-TP): Implementa os modelos exatos utilizados para análise comparativa.
 
 4. [Meta-Heurística HGS-CARP](https://github.com/brunof5/HGS-CARP): Implementação do algoritmo HGS-CARP adaptado para lidar com penalidades de conversão.
 
@@ -80,4 +80,4 @@ Siga os passos abaixo para configurar o ambiente e executar a aplicação.
 
 ## 📚 Artigo / TCC (Base Teórica)
 
-FERREIRA, B. C. **O Problema de Roteamento em Nós, Arestas e Arcos com Penalidades de Conversão: Um Estudo no Contexto da Coleta Seletiva de Lixo**. TCC (Bacharelado) — Faculdade de Ciência da Computação, Universidade Federal de Lavras. Lavras, p. 82. 2025.
+FERREIRA, B. C. **O Problema de Roteamento em Nós, Arestas e Arcos com Penalidades de Conversão: Um Estudo no Contexto da Coleta Seletiva de Lixo**. TCC (Bacharelado) — Faculdade de Ciência da Computação, Universidade Federal de Lavras. Lavras, p. 81. 2025.
